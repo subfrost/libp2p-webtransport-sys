@@ -4,6 +4,7 @@ pub mod multiaddr;
 pub mod upgrader;
 
 use crate::error::Error;
+use async_trait::async_trait;
 use futures::{future::Future, StreamExt};
 use libp2p::{
     core::{
@@ -11,8 +12,7 @@ use libp2p::{
         transport::{DialOpts, ListenerId, TransportEvent},
         upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade},
     },
-    identity,
-    noise, PeerId,
+    identity, noise, PeerId,
 };
 pub use multiaddr::WebTransportMultiaddr;
 use std::{
@@ -43,6 +43,7 @@ impl WebTransport {
     }
 }
 
+#[async_trait]
 impl libp2p::Transport for WebTransport {
     type Output = Output;
     type Error = Error;
@@ -84,41 +85,35 @@ impl libp2p::Transport for WebTransport {
             let mut stop_rx = stop_rx;
 
             loop {
-                tokio::select! {
-                    _ = &mut stop_rx => {
-                        break;
-                    }
-                    incoming_session = endpoint.accept() => {
-                        let session_request = incoming_session;
-                        let conn = session_request.await.unwrap();
-
-                        let keypair = keypair.clone();
-                        let addr = addr.clone();
-                        let upgrade = Box::pin(async move {
-                            let conn_inner = conn;
-                            let (send, recv) = conn_inner.open_bi().await.unwrap().await.unwrap();
-                            let noise_stream = upgrader::NoiseStream {
-                                recv: recv.compat(),
-                                send: send.compat_write(),
-                            };
-
-                            let noise_config = noise::Config::new(&keypair).unwrap();
-                            let (peer_id, _noise_output) =
-                                noise_config.upgrade_inbound(noise_stream, "").await.unwrap();
-
-                            let muxer = crate::stream::Muxer::new(conn_inner, None);
-                            Ok((peer_id, StreamMuxerBox::new(muxer)))
-                        });
-
-                        let event = TransportEvent::Incoming {
-                            listener_id: id,
-                            upgrade,
-                            local_addr: addr.clone(),
-                            send_back_addr: addr.clone(), // TODO: get from conn
+                let incoming_session = endpoint.accept().await;
+                if let Some(incoming_session) = incoming_session {
+                    let keypair = keypair.clone();
+                    let addr = addr.clone();
+                    let upgrade = Box::pin(async move {
+                        let session_request = incoming_session.await?;
+                        let conn = session_request.accept().await?;
+                        let (send, recv) = conn.open_bi().await?.await?;
+                        let noise_stream = upgrader::NoiseStream {
+                            recv: recv.compat(),
+                            send: send.compat_write(),
                         };
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
+
+                        let noise_config = noise::Config::new(&keypair)?;
+                        let (peer_id, _noise_output) =
+                            noise_config.upgrade_inbound(noise_stream, "").await?;
+
+                        let muxer = crate::stream::Muxer::new(conn, None);
+                        Ok((peer_id, StreamMuxerBox::new(muxer)))
+                    });
+
+                    let event = TransportEvent::Incoming {
+                        listener_id: id,
+                        upgrade,
+                        local_addr: addr.clone(),
+                        send_back_addr: addr.clone(), // TODO: get from conn
+                    };
+                    if tx.send(event).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -165,7 +160,7 @@ impl libp2p::Transport for WebTransport {
                 "https://{}:{}/.well-known/libp2p-webtransport",
                 s_addr.host, s_addr.port
             );
-            let conn = endpoint.connect(url).await.unwrap();
+            let conn = endpoint.connect(url).await?;
 
             let (send, recv) = conn.open_bi().await?.await?;
             let noise_stream = upgrader::NoiseStream {
@@ -177,7 +172,7 @@ impl libp2p::Transport for WebTransport {
                 s_addr.remote_peer_id.ok_or(Error::MissingRemotePeerId)?;
             let noise_config = noise::Config::new(&keypair)?;
             let (peer_id, _noise_output) = noise_config
-                .upgrade_outbound(noise_stream, remote_peer_id)
+                .upgrade_outbound(noise_stream, remote_peer_id.to_string().as_str())
                 .await?;
 
             Ok((

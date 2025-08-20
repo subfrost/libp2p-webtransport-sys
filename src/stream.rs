@@ -21,8 +21,8 @@ use wtransport::{
 pub struct Muxer {
     conn: Connection,
     endpoint: Option<wtransport::Endpoint<Client>>,
-    inbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), wtransport::error::ConnectionError>> + Send>>>,
-    outbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), io::Error>> + Send>>>,
+    inbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), wtransport::error::ConnectionError>> + Send + 'static>>>,
+    outbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), io::Error>> + Send + 'static>>>,
 }
 
 impl Muxer {
@@ -80,7 +80,8 @@ impl StreamMuxer for Muxer {
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         let self_mut = self.get_mut();
         if self_mut.inbound_fut.is_none() {
-            self_mut.inbound_fut = Some(Box::pin(self_mut.conn.accept_bi()));
+            let conn = self_mut.conn.clone();
+            self_mut.inbound_fut = Some(Box::pin(async move { conn.accept_bi().await }));
         }
 
         let fut = self_mut.inbound_fut.as_mut().unwrap();
