@@ -64,7 +64,6 @@ impl AsyncWrite for Substream {
 impl StreamMuxer for Muxer {
     type Substream = Substream;
     type Error = io::Error;
-    type Event = StreamMuxerEvent;
 
     fn poll_inbound(
         mut self: Pin<&mut Self>,
@@ -108,15 +107,19 @@ impl StreamMuxer for Muxer {
             Ok(Substream { recv, send })
         };
 
-        // We need to block on this future, which is not ideal in a poll function.
-        // This is a limitation of the current wtransport API.
-        // A better approach would be to have a poll-based API for opening streams.
-        // For now, we'll use a temporary runtime to block on the future.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        Poll::Ready(runtime.block_on(fut))
+        // This is not ideal, but we need to block on the future.
+        // We spawn a new thread to block on the future and return the result.
+        let result = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fut)
+        })
+        .join()
+        .unwrap();
+
+        Poll::Ready(result)
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -127,7 +130,7 @@ impl StreamMuxer for Muxer {
     fn poll(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-    ) -> Poll<Result<Self::Event, Self::Error>> {
+    ) -> Poll<Result<StreamMuxerEvent, Self::Error>> {
         Poll::Pending
     }
 }

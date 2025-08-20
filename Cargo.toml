@@ -5,23 +5,19 @@ edition = "2024"
 
 [dependencies]
 wtransport = { version = "0.6.1", features = ["quinn"] }
-libp2p-core = { workspace = true }
-libp2p-identity = { workspace = true }
-futures = { workspace = true }
-multihash = { version = "0.19.0", features = ["sha2"] }
+libp2p-core = "0.39.1"
+libp2p-identity = { version = "0.1", features = ["ed25519"] }
+futures = "0.3.28"
+multihash = "0.19.0"
 multiaddr = { version = "0.18.0" }
-tracing = { workspace = true }
+tracing = "0.1"
 thiserror = "1.0"
 url = "2.4.0"
 sha2 = "0.10.8"
-libp2p-noise = { workspace = true }
+libp2p-noise = "0.40.0"
 tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3.28"
 rcgen = "0.11.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 env_logger = "0.10"
-
-[lints]
-workspace = true

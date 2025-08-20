@@ -269,14 +269,10 @@ impl Transport for WebTransport {
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Dial, Self::Error>> {
-        for (id, (rx, _)) in self.listeners.iter_mut() {
-            match rx.poll_next_unpin(cx) {
-                Poll::Ready(Some(event)) => return Poll::Ready(event),
-                Poll::Ready(None) => {
-                    // TODO: Handle listener closed
-                }
-                Poll::Pending => {}
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        for (_id, (rx, _)) in self.listeners.iter_mut() {
+            if let Poll::Ready(Some(event)) = rx.poll_next_unpin(cx) {
+                return Poll::Ready(event);
             }
         }
 
@@ -285,5 +281,12 @@ impl Transport for WebTransport {
 
     fn address_translation(&self, _listen: &Multiaddr, _observed: &Multiaddr) -> Option<Multiaddr> {
         None
+    }
+
+    fn dial_as_listener(
+        &mut self,
+        addr: Multiaddr,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.dial(addr)
     }
 }

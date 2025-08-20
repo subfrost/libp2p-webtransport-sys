@@ -22,14 +22,14 @@ pub enum Error {
     InvalidCerthash,
     /// An error occurred during the Noise handshake.
     #[error("Noise handshake error: {0}")]
-    Noise(#[from] libp2p_noise::Error),
+    Noise(#[from] libp2p_noise::NoiseError),
     /// The remote peer ID is missing from the multiaddress.
     #[error("Remote peer ID is missing from the multiaddress")]
     MissingRemotePeerId,
     /// An error occurred during a TLS operation.
     #[error("TLS error: {0}")]
-    Tls(#[from] rcgen::Error),
+    Tls(#[from] rcgen::RcgenError),
     /// An error occurred while creating a wtransport endpoint.
     #[error("wtransport endpoint error: {0}")]
-    WTransportEndpoint(#[from] wtransport::error::EndpointError),
+    WTransportEndpoint(#[from] wtransport::error::CreationError),
 }
