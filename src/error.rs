@@ -29,4 +29,7 @@ pub enum Error {
     /// An error occurred during a TLS operation.
     #[error("TLS error: {0}")]
     Tls(#[from] rcgen::Error),
+    /// An error occurred while creating a wtransport endpoint.
+    #[error("wtransport endpoint error: {0}")]
+    WTransportEndpoint(#[from] wtransport::error::EndpointError),
 }

@@ -8,6 +8,7 @@
 //! WebTransport connections with other libp2p peers.
 
 pub mod error;
+pub mod stream;
 pub mod transport;
 
 pub use transport::WebTransport;

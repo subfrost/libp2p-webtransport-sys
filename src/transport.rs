@@ -7,33 +7,27 @@ use libp2p_core::{
     PeerId,
 };
 use std::{
+    collections::HashMap,
     pin::Pin,
     task::{Context, Poll},
 };
-use futures::future::Future;
-use futures::{AsyncRead, AsyncWrite};
-use futures::channel::mpsc;
-use futures::{AsyncRead, AsyncWrite, StreamExt};
+use futures::{future::Future, stream::Stream, AsyncRead, AsyncWrite, StreamExt};
 use libp2p_core::identity;
 use libp2p_core::muxing::StreamMuxer;
-use std::collections::HashMap;
 use std::io;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use wtransport::RecvStream;
-use wtransport::SendStream;
+use wtransport::{RecvStream, SendStream};
 
 /// The WebTransport transport.
 pub struct WebTransport {
     keypair: identity::Keypair,
-    listeners: HashMap<ListenerId, Listener>,
+    listeners: HashMap<ListenerId, (mpsc::Receiver<TransportEvent<ListenerUpgrade, Dial, Error>>, oneshot::Sender<()>)>,
 }
 
-struct Listener {
-    sender: mpsc::Sender<TransportEvent<ListenerUpgrade, Dial, Error>>,
-    _handle: oneshot::Sender<()>,
-}
+type Dial = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
+type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
+type Output = (PeerId, crate::stream::Muxer);
 
 impl WebTransport {
     /// Creates a new WebTransport transport.
@@ -139,10 +133,10 @@ impl WebTransportMultiaddr {
 }
 
 impl Transport for WebTransport {
-    type Output = (PeerId, impl StreamMuxer<Substream = ()>); // Placeholder for muxer
+    type Output = Output;
     type Error = Error;
-    type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
-    type Dial = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
+    type ListenerUpgrade = ListenerUpgrade;
+    type Dial = Dial;
 
     fn listen_on(
         &mut self,
@@ -152,8 +146,8 @@ impl Transport for WebTransport {
         let s_addr = WebTransportMultiaddr::from_multiaddr(&addr)
             .ok_or(TransportError::Other(Error::InvalidMultiaddr(addr.clone())))?;
 
-        let (tx, mut rx) = mpsc::channel(1);
-        let (handle, mut stop) = oneshot::channel();
+        let (tx, rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = oneshot::channel();
 
         let keypair = self.keypair.clone();
 
@@ -173,37 +167,48 @@ impl Transport for WebTransport {
 
             let endpoint = wtransport::Endpoint::server(server_config).unwrap();
 
+            let mut stop_rx = stop_rx;
+
             loop {
                 tokio::select! {
-                    _ = &mut stop => {
+                    _ = &mut stop_rx => {
                         break;
                     }
                     incoming_session = endpoint.accept() => {
-                        let session_request = incoming_session.await.unwrap();
-                        let conn = session_request.accept().await.unwrap();
+                        if let Some(session_request) = incoming_session.await {
+                            let conn = session_request.await.unwrap();
+                            let (send, recv) = conn.open_bi().await.unwrap().await.unwrap();
+                            let noise_stream = NoiseStream {
+                                recv: recv.compat(),
+                                send: send.compat_write(),
+                            };
 
-                        let (send, recv) = conn.open_bi().await.unwrap().await.unwrap();
-                        let noise_stream = NoiseStream {
-                            recv: recv.compat(),
-                            send: send.compat_write(),
-                        };
+                            let noise_config = libp2p_noise::Config::new(&keypair).unwrap();
+                            let (peer_id, _noise_output) = libp2p_noise::secure_inbound(noise_config, noise_stream).await.unwrap();
 
-                        let noise_config = libp2p_noise::Config::new(&keypair).unwrap();
-                        let (peer_id, _noise_output) = libp2p_noise::secure_inbound(noise_config, noise_stream).await.unwrap();
-
-                        // TODO: Muxer setup
+                            let muxer = crate::stream::Muxer::new(conn);
+                            let event = TransportEvent::Incoming {
+                                listener_id: id,
+                                upgrade: Box::pin(async move { Ok((peer_id, muxer)) }),
+                                local_addr: addr.clone(),
+                                remote_addr: addr.clone(), // TODO: get from conn
+                            };
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
         });
 
-        self.listeners.insert(id, Listener { sender: tx, _handle: handle });
+        self.listeners.insert(id, (rx, stop_tx));
 
         Ok(())
     }
 
-    fn remove_listener(&mut self, _id: ListenerId) -> bool {
-        todo!()
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.listeners.remove(&id).is_some()
     }
 
     fn dial(&mut self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
@@ -248,7 +253,7 @@ impl Transport for WebTransport {
             let (peer_id, _noise_output) =
                 libp2p_noise::secure_outbound(noise_config, noise_stream, remote_peer_id).await?;
 
-            todo!("Muxer setup")
+            Ok((peer_id, crate::stream::Muxer::new(conn)))
         }))
     }
 
@@ -262,9 +267,19 @@ impl Transport for WebTransport {
     }
 
     fn poll(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Dial, Self::Error>> {
+        for (id, (rx, _)) in self.listeners.iter_mut() {
+            match rx.poll_next_unpin(cx) {
+                Poll::Ready(Some(event)) => return Poll::Ready(event),
+                Poll::Ready(None) => {
+                    // TODO: Handle listener closed
+                }
+                Poll::Pending => {}
+            }
+        }
+
         Poll::Pending
     }
 
