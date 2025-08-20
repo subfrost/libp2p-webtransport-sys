@@ -1,5 +1,7 @@
 //! Error types for the WebTransport transport.
 
+use libp2p::identity;
+use libp2p::multiaddr;
 use thiserror::Error;
 
 /// Error that can happen when dialing a peer.
@@ -20,16 +22,19 @@ pub enum Error {
     /// The certificate hash is invalid.
     #[error("Invalid certificate hash")]
     InvalidCerthash,
+    /// An error occurred while opening a stream.
+    #[error("Stream opening error: {0}")]
+    StreamOpening(#[from] wtransport::error::StreamOpeningError),
     /// An error occurred during the Noise handshake.
     #[error("Noise handshake error: {0}")]
-    Noise(#[from] libp2p_noise::NoiseError),
+    Noise(#[from] libp2p::noise::Error),
     /// The remote peer ID is missing from the multiaddress.
     #[error("Remote peer ID is missing from the multiaddress")]
     MissingRemotePeerId,
     /// An error occurred during a TLS operation.
     #[error("TLS error: {0}")]
     Tls(#[from] rcgen::RcgenError),
-    /// An error occurred while creating a wtransport endpoint.
-    #[error("wtransport endpoint error: {0}")]
-    WTransportEndpoint(#[from] wtransport::error::CreationError),
+    /// The keypair is invalid.
+    #[error("Invalid keypair: {0}")]
+    InvalidKeypair(#[from] identity::DecodingError),
 }

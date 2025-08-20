@@ -1,39 +1,48 @@
 //! A stream muxer for WebTransport connections.
 
-use futures::{AsyncRead, AsyncWrite};
-use libp2p_core::muxing::{StreamMuxer, Substream, StreamMuxerEvent, StreamMuxerFuture};
+use futures::{
+    io::{AsyncRead, AsyncWrite},
+    Future,
+};
+use libp2p::core::muxing::{StreamMuxer, StreamMuxerEvent};
 use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
 };
-use futures::future::BoxFuture;
-use futures::FutureExt;
-use wtransport::stream::OpeningBiStream;
-use wtransport::{Connection, RecvStream, SendStream};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use wtransport::{
+    endpoint::endpoint_side::Client,
+    stream::{RecvStream, SendStream},
+    Connection,
+};
 
 /// A stream muxer for WebTransport connections.
 pub struct Muxer {
     conn: Connection,
-    next_inbound_stream: Option<BoxFuture<'static, Result<Substream, io::Error>>>,
+    endpoint: Option<wtransport::Endpoint<Client>>,
+    inbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), wtransport::error::ConnectionError>> + Send>>>,
+    outbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), io::Error>> + Send>>>,
 }
 
 impl Muxer {
     /// Creates a new `Muxer`.
-    pub fn new(conn: Connection) -> Self {
+    pub fn new(conn: Connection, endpoint: Option<wtransport::Endpoint<Client>>) -> Self {
         Self {
             conn,
-            next_inbound_stream: None,
+            endpoint,
+            inbound_fut: None,
+            outbound_fut: None,
         }
     }
 }
 
-pub struct Substream {
-    recv: RecvStream,
-    send: SendStream,
+pub struct BiStream {
+    send: Compat<SendStream>,
+    recv: Compat<RecvStream>,
 }
 
-impl AsyncRead for Substream {
+impl AsyncRead for BiStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -43,7 +52,7 @@ impl AsyncRead for Substream {
     }
 }
 
-impl AsyncWrite for Substream {
+impl AsyncWrite for BiStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -62,68 +71,75 @@ impl AsyncWrite for Substream {
 }
 
 impl StreamMuxer for Muxer {
-    type Substream = Substream;
+    type Substream = BiStream;
     type Error = io::Error;
 
     fn poll_inbound(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        if self.next_inbound_stream.is_none() {
-            let conn = self.conn.clone();
-            self.next_inbound_stream = Some(
-                async move {
-                    let (send, recv) = conn
-                        .accept_bi()
-                        .await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                    Ok(Substream { recv, send })
-                }
-                .boxed(),
-            );
+        let self_mut = self.get_mut();
+        if self_mut.inbound_fut.is_none() {
+            self_mut.inbound_fut = Some(Box::pin(self_mut.conn.accept_bi()));
         }
 
-        if let Some(fut) = self.next_inbound_stream.as_mut() {
-            let res = futures::ready!(fut.poll_unpin(cx));
-            self.next_inbound_stream = None;
-            return Poll::Ready(res);
+        let fut = self_mut.inbound_fut.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok((send, recv))) => {
+                self_mut.inbound_fut = None;
+                Poll::Ready(Ok(BiStream {
+                    send: send.compat_write(),
+                    recv: recv.compat(),
+                }))
+            }
+            Poll::Ready(Err(e)) => {
+                self_mut.inbound_fut = None;
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
         }
-
-        Poll::Pending
     }
 
     fn poll_outbound(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        let conn = self.conn.clone();
-        let fut = async move {
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            Ok(Substream { recv, send })
-        };
+        let self_mut = self.get_mut();
+        if self_mut.outbound_fut.is_none() {
+            let conn = self_mut.conn.clone();
+            self_mut.outbound_fut = Some(Box::pin(async move {
+                let opening_bi = conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                opening_bi
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            }));
+        }
 
-        // This is not ideal, but we need to block on the future.
-        // We spawn a new thread to block on the future and return the result.
-        let result = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(fut)
-        })
-        .join()
-        .unwrap();
-
-        Poll::Ready(result)
+        let fut = self_mut.outbound_fut.as_mut().unwrap();
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok((send, recv))) => {
+                self_mut.outbound_fut = None;
+                Poll::Ready(Ok(BiStream {
+                    send: send.compat_write(),
+                    recv: recv.compat(),
+                }))
+            }
+            Poll::Ready(Err(e)) => {
+                self_mut.outbound_fut = None;
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.conn.close(0u32.into(), b"close");
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0u32.into(), b"close");
+        }
         Poll::Ready(Ok(()))
     }
 
