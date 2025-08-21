@@ -5,7 +5,7 @@ use libp2p::{
     multiaddr::{Multiaddr, Protocol},
     Transport,
 };
-use libp2p_webtransport_sys::transport as WebTransport;
+use libp2p_webtransport_sys::WebTransport;
 
 #[tokio::test]
 async fn dial_and_listen() {
