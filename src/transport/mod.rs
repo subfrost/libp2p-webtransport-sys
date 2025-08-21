@@ -168,7 +168,7 @@ impl libp2p::Transport for WebTransport {
             let noise_config = noise::Config::new(&keypair)?;
             let remote_peer_id_str = remote_peer_id.to_string();
             let (peer_id, _noise_output) = noise_config
-                .upgrade_outbound(noise_stream, &remote_peer_id_str)
+                .upgrade_outbound(noise_stream, Box::leak(remote_peer_id_str.into_boxed_str()),)
                 .await?;
 
             Ok((
