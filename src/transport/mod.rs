@@ -56,6 +56,15 @@ pub struct WebTransport {
     listeners: SelectAll<Listener>,
 }
 
+impl Clone for WebTransport {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            listeners: SelectAll::new(),
+        }
+    }
+}
+
 type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
 type Output = (PeerId, StreamMuxerBox);
 
@@ -107,15 +116,19 @@ impl libp2p::Transport for WebTransport {
         _opts: DialOpts,
     ) -> Result<Self::Dial, libp2p::core::transport::TransportError<Self::Error>> {
         log::debug!("dialing {}", addr);
-        let s_addr = WebTransportMultiaddr::from_dial_multiaddr(&addr)
-            .ok_or(libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr)))?;
+        let s_addr = WebTransportMultiaddr::from_dial_multiaddr(&addr).ok_or(
+            libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr)),
+        )?;
 
         let keypair = self.keypair.clone();
 
         Ok(Box::pin(async move {
             log::trace!("dialer task started");
+
+
             let hashes = s_addr
                 .certhashes
+                .clone()
                 .into_iter()
                 .map(|mh| {
                     mh.digest()
@@ -210,7 +223,11 @@ impl Listener {
         s_addr: WebTransportMultiaddr,
         listen_addr: libp2p::Multiaddr,
     ) -> Result<Self, libp2p::core::transport::TransportError<Error>> {
-        let cert = rcgen::generate_simple_self_signed(vec![s_addr.host.clone()]).unwrap();
+        let mut cert_params = rcgen::CertificateParams::new(vec![s_addr.host.clone()]);
+        cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        cert_params.not_before = time::OffsetDateTime::now_utc();
+        cert_params.not_after = time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
+        let cert = rcgen::Certificate::from_params(cert_params).unwrap();
         let cert_der = cert.serialize_der().unwrap();
         let cert_hash = Sha256::digest(&cert_der);
         let cert_hash =
