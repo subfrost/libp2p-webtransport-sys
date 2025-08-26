@@ -1,33 +1,139 @@
-use futures_util::stream::StreamExt;
+// NOTE: This test needs to be run with the `timeout` command on Linux, e.g.
+// `timeout 120 RUST_LOG=debug cargo test -- --nocapture --test-threads=1`
+// NOTE: This test needs to be run with the `timeout` command on Linux, e.g.
+// `timeout 120 RUST_LOG=debug cargo test -- --nocapture --test-threads=1`
+use futures::{future::poll_fn, FutureExt};
+use log;
 use libp2p::{
-    core::transport::{ListenerId, TransportEvent},
+    core::transport::{DialOpts, ListenerId, TransportEvent},
     identity,
-    multiaddr::{Multiaddr, Protocol},
+    multiaddr::{multihash, Multiaddr, Protocol},
     Transport,
 };
-use libp2p_webtransport_sys::Transport as WebTransport;
+use libp2p_webtransport_sys::transport::WebTransport;
+use std::pin::Pin;
 
 #[tokio::test]
-async fn dial_and_listen() {
+async fn close_listener() {
     let _ = env_logger::try_init();
     let id_keys = identity::Keypair::generate_ed25519();
     let mut transport = WebTransport::new(id_keys);
 
-    let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
-        .parse()
-        .unwrap();
-    transport.listen_on(addr).unwrap();
+    assert!(
+        poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
+            .now_or_never()
+            .is_none()
+    );
 
-    let listener_addr = match transport.select_next_some().await {
+    // Run test twice to check that there is no unexpected behaviour if `Transport.listener`
+    // is temporarily empty.
+    for _ in 0..2 {
+        let id = ListenerId::next();
+        transport
+            .listen_on(id, "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap())
+            .unwrap();
+
+        match poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx)).await {
+            TransportEvent::NewAddress {
+                listener_id,
+                listen_addr,
+            } => {
+                assert_eq!(listener_id, id);
+                assert!(
+                    matches!(listen_addr.iter().next(), Some(Protocol::Ip4(a)) if !a.is_unspecified())
+                );
+                assert!(
+                    matches!(listen_addr.iter().nth(1), Some(Protocol::Udp(port)) if port != 0)
+                );
+                assert!(matches!(
+                    listen_addr.iter().nth(2),
+                    Some(Protocol::QuicV1)
+                ));
+                assert!(matches!(
+                    listen_addr.iter().nth(3),
+                    Some(Protocol::WebTransport)
+                ));
+            }
+            e => panic!("Unexpected event: {e:?}"),
+        }
+        assert!(transport.remove_listener(id));
+        match poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx)).await {
+            TransportEvent::ListenerClosed {
+                listener_id,
+                reason: Ok(()),
+            } => {
+                assert_eq!(listener_id, id);
+            }
+            e => panic!("Unexpected event: {e:?}"),
+        }
+        // Poll once again so that the listener has the chance to return `Poll::Ready(None)` and
+        // be removed from the list of listeners.
+        assert!(
+            poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
+                .now_or_never()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn dial_and_listen() {
+    let _ = env_logger::try_init();
+    log::info!("starting dial_and_listen test");
+    let id_keys = identity::Keypair::generate_ed25519();
+    let mut transport = WebTransport::new(id_keys.clone());
+
+    let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap();
+    log::debug!("listening on {}", addr);
+    transport.listen_on(ListenerId::next(), addr).unwrap();
+
+    log::debug!("polling for NewAddress event");
+    let listener_addr = match poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx)).await {
         TransportEvent::NewAddress { listen_addr, .. } => listen_addr,
-        _ => panic!("Expected NewAddress event"),
+        e => panic!("Expected NewAddress event, got {:?}", e),
+    };
+    log::info!("listener address: {}", listener_addr);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519());
+    let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
+    log::info!("dialing {}", dial_addr);
+
+    let dial = dialer
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            },
+        )
+        .unwrap();
+
+    log::debug!("joining dial and listen futures");
+
+    let listen_fut = async {
+        loop {
+            log::debug!("[listen_fut] polling transport");
+            match poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx)).await {
+                TransportEvent::Incoming { upgrade, .. } => {
+                    log::debug!("[listen_fut] got incoming connection");
+                    return upgrade;
+                }
+                e => {
+                    log::debug!("[listen_fut] got event: {:?}", e);
+                }
+            }
+        }
     };
 
-    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519());
-    let dial = dialer.dial(listener_addr).unwrap();
+    let (res_dial, upgrade) = futures::future::join(dial, listen_fut).await;
+    log::info!("join completed");
 
-    let (res_dial, res_listen) = futures::future::join(dial, transport.select_next_some()).await;
+    log::debug!("dial result: {:?}", res_dial);
+    assert!(res_dial.is_ok(), "dial failed: {:?}", res_dial.err());
 
-    assert!(res_dial.is_ok());
+    let res_listen = upgrade.await;
+    log::debug!("listen result: {:?}", res_listen);
     assert!(res_listen.is_ok());
+    log::info!("dial_and_listen test finished");
 }

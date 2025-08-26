@@ -37,6 +37,7 @@ impl Muxer {
     }
 }
 
+/// A bidirectional stream.
 pub struct BiStream {
     send: Compat<SendStream>,
     recv: Compat<RecvStream>,

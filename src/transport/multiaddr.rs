@@ -13,8 +13,38 @@ pub struct WebTransportMultiaddr {
 }
 
 impl WebTransportMultiaddr {
-    /// Parses a multiaddress into a `WebTransportMultiaddr`.
-    pub(crate) fn from_multiaddr(addr: &Multiaddr) -> Option<Self> {
+    /// Parses a multiaddress into a `WebTransportMultiaddr` for listening.
+    pub(crate) fn from_listen_multiaddr(addr: &Multiaddr) -> Option<Self> {
+        let mut iter = addr.iter();
+
+        let (host, port) = match (iter.next()?, iter.next()?) {
+            (Protocol::Ip4(ip), Protocol::Udp(p)) => (ip.to_string(), p),
+            (Protocol::Ip6(ip), Protocol::Udp(p)) => (format!("[{}]", ip), p),
+            (Protocol::Dns(dns), Protocol::Udp(p))
+            | (Protocol::Dns4(dns), Protocol::Udp(p))
+            | (Protocol::Dns6(dns), Protocol::Udp(p)) => (dns.to_string(), p),
+            _ => return None,
+        };
+
+        match iter.next()? {
+            Protocol::QuicV1 => {}
+            _ => return None,
+        }
+
+        if !matches!(iter.next(), Some(Protocol::WebTransport)) {
+            return None;
+        }
+
+        Some(Self {
+            host,
+            port,
+            certhashes: vec![],
+            remote_peer_id: None,
+        })
+    }
+
+    /// Parses a multiaddress into a `WebTransportMultiaddr` for dialing.
+    pub(crate) fn from_dial_multiaddr(addr: &Multiaddr) -> Option<Self> {
         let mut iter = addr.iter();
 
         let (host, port) = match (iter.next()?, iter.next()?) {

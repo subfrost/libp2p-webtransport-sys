@@ -7,6 +7,7 @@ use std::{
 use tokio_util::compat::Compat;
 use wtransport::{RecvStream, SendStream};
 
+/// A stream that has been upgraded to use the Noise protocol.
 pub struct NoiseStream {
     pub(crate) recv: Compat<RecvStream>,
     pub(crate) send: Compat<SendStream>,

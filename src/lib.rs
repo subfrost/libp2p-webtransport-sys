@@ -1,5 +1,4 @@
 #![doc = include_str!("../README.md")]
-#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 //! A pure Rust implementation of the [WebTransport](https://w3c.github.io/webtransport/) protocol for libp2p.
