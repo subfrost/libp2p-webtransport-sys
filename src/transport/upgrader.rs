@@ -19,7 +19,9 @@ impl AsyncRead for NoiseStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.recv).poll_read(cx, buf)
+        let poll = Pin::new(&mut self.recv).poll_read(cx, buf);
+        log::trace!("[NoiseStream::poll_read] poll: {:?}", poll);
+        poll
     }
 }
 
@@ -29,14 +31,20 @@ impl AsyncWrite for NoiseStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.send).poll_write(cx, buf)
+        let poll = Pin::new(&mut self.send).poll_write(cx, buf);
+        log::trace!("[NoiseStream::poll_write] poll: {:?}", poll);
+        poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.send).poll_flush(cx)
+        let poll = Pin::new(&mut self.send).poll_flush(cx);
+        log::trace!("[NoiseStream::poll_flush] poll: {:?}", poll);
+        poll
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.send).poll_close(cx)
+        let poll = Pin::new(&mut self.send).poll_close(cx);
+        log::trace!("[NoiseStream::poll_close] poll: {:?}", poll);
+        poll
     }
 }

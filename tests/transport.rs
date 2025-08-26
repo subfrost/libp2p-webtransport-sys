@@ -6,7 +6,6 @@ use futures::{channel::mpsc, future::poll_fn, FutureExt, SinkExt, StreamExt};
 use log;
 use libp2p::{
     core::transport::{DialOpts, ListenerId, TransportEvent},
-    core::Endpoint,
     identity,
     multiaddr::{Multiaddr, Protocol},
     Transport,
@@ -95,7 +94,7 @@ async fn dial_and_listen() {
     };
     log::info!("listener address: {}", listener_addr);
 
-    let (mut tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::channel(1);
 
     tokio::spawn(async move {
         loop {
@@ -103,7 +102,10 @@ async fn dial_and_listen() {
                 TransportEvent::Incoming { upgrade, .. } => {
                     let mut tx = tx.clone();
                     tokio::spawn(async move {
-                        tx.send(upgrade.await).await.unwrap();
+                        log::info!("upgrading incoming connection");
+                        let result = upgrade.await;
+                        log::info!("incoming upgrade finished: {:?}", result);
+                        tx.send(result).await.unwrap();
                     });
                 }
                 _ => {}
@@ -118,15 +120,21 @@ async fn dial_and_listen() {
         .dial(
             dial_addr,
             DialOpts {
-                role: Endpoint::Dialer,
+                role: libp2p::core::Endpoint::Dialer,
                 port_use: libp2p::core::transport::PortUse::Reuse,
             },
         )
         .unwrap();
 
-    let (res_dial, res_listen) = tokio::join!(dial, rx.next());
-    log::info!("join completed");
+    let dial_task = tokio::spawn(dial);
 
+    let (res_dial, res_listen) = tokio::join!(dial_task, rx.next());
+    log::info!("join completed");
+    log::info!("dial task result: {:?}", res_dial);
+    log::info!("listen task result: {:?}", res_listen);
+
+    assert!(res_dial.is_ok(), "dial task failed");
+    let res_dial = res_dial.unwrap();
     assert!(res_dial.is_ok(), "dial failed: {:?}", res_dial.err());
     let res_listen = res_listen.unwrap();
     assert!(res_listen.is_ok());

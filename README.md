@@ -1,6 +1,6 @@
 # libp2p-webtransport-sys
 
-This crate provides a pure Rust implementation of the [WebTransport](https://w3c.github.io/webtransport/) protocol for libp2p.
+This crate provides a pure Rust implementation of the WebTransport protocol for libp2p.
 
 ## Overview
 
@@ -25,9 +25,11 @@ libp2p-webtransport-sys = { git = "https://github.com/libp2p/rust-libp2p" }
 Then, you can create a new `WebTransport` transport and add it to your `Swarm`:
 
 ```rust
-use libp2p_webtransport_sys::WebTransport;
-use libp2p_core::transport::Transport;
-use libp2p_core::identity;
+use libp2p_webtransport_sys::transport::WebTransport;
+use libp2p::identity;
 
-let local_key = identity::Keypair::generate_ed25519();
-let transport = WebTransport::new(local_key);
+#[tokio::main]
+async fn main() {
+    let local_key = identity::Keypair::generate_ed25519();
+    let mut transport = WebTransport::new(local_key);
+}

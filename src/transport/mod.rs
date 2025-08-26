@@ -163,9 +163,9 @@ impl libp2p::Transport for WebTransport {
                 s_addr.remote_peer_id.ok_or(Error::MissingRemotePeerId)?;
             let noise_config = noise::Config::new(&keypair)?;
             log::debug!("performing noise handshake");
-            let (peer_id, _noise_output) = noise_config
-                .upgrade_outbound(noise_stream, "l")
-                .await?;
+            let noise_upgrade = noise_config.upgrade_outbound(noise_stream, "l");
+            futures::pin_mut!(noise_upgrade);
+            let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await?;
             log::debug!("noise handshake successful, peer_id={}", peer_id);
 
             Ok((
@@ -352,8 +352,8 @@ impl Stream for Listener {
                         log::trace!("accepted session request");
                         let conn = session_request.accept().await?;
                         log::trace!("accepted connection");
-                        let (send, recv) = conn.open_bi().await?.await?;
-                        log::trace!("opened bidirectional stream");
+                        let (send, recv) = conn.accept_bi().await?;
+                        log::trace!("accepted bidirectional stream");
                         let noise_stream = upgrader::NoiseStream {
                             recv: recv.compat(),
                             send: send.compat_write(),
@@ -361,8 +361,9 @@ impl Stream for Listener {
 
                         let noise_config = noise::Config::new(&keypair)?;
                         log::trace!("performing noise handshake");
-                        let (peer_id, _noise_output) =
-                            noise_config.upgrade_inbound(noise_stream, "").await?;
+                        let noise_upgrade = noise_config.upgrade_inbound(noise_stream, "");
+                        futures::pin_mut!(noise_upgrade);
+                        let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await?;
                         log::debug!("noise handshake successful, peer_id={}", peer_id);
 
                         let muxer = crate::stream::Muxer::new(conn, None);
