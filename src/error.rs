@@ -7,9 +7,9 @@ use thiserror::Error;
 /// Error that can happen when dialing a peer.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// An error occurred during the transport.
-    #[error("Transport error: {0}")]
-    Transport(#[from] std::io::Error),
+    /// An I/O error occurred.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// The multiaddress is not a valid WebTransport multiaddress.
     #[error("Invalid multiaddress: {0}")]
     InvalidMultiaddr(multiaddr::Multiaddr),
@@ -33,8 +33,11 @@ pub enum Error {
     MissingRemotePeerId,
     /// An error occurred during a TLS operation.
     #[error("TLS error: {0}")]
-    Tls(#[from] rcgen::RcgenError),
+    Tls(String),
     /// The keypair is invalid.
     #[error("Invalid keypair: {0}")]
     InvalidKeypair(#[from] identity::DecodingError),
+    /// An error occurred while creating the wtransport endpoint.
+    #[error("Endpoint error: {0}")]
+    Endpoint(String),
 }

@@ -1625,6 +1625,7 @@ dependencies = [
  "multihash",
  "multihash-codetable",
  "rcgen 0.11.3",
+ "rustls-pemfile",
  "sha2",
  "thiserror 1.0.69",
  "time",

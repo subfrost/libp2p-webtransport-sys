@@ -10,14 +10,14 @@ use libp2p::{
     multiaddr::{Multiaddr, Protocol},
     Transport,
 };
-use libp2p_webtransport_sys::transport::WebTransport;
+use libp2p_webtransport_sys::transport::{Config, WebTransport};
 use std::pin::Pin;
 
 #[tokio::test]
 async fn close_listener() {
     let _ = env_logger::try_init();
     let id_keys = identity::Keypair::generate_ed25519();
-    let mut transport = WebTransport::new(id_keys);
+    let mut transport = WebTransport::new(id_keys, Config::SelfSigned);
 
     assert!(
         poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
@@ -81,7 +81,7 @@ async fn dial_and_listen() {
     let _ = env_logger::try_init();
     log::info!("starting dial_and_listen test");
     let id_keys = identity::Keypair::generate_ed25519();
-    let mut listener = WebTransport::new(id_keys.clone());
+    let mut listener = WebTransport::new(id_keys.clone(), Config::SelfSigned);
 
     let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap();
     log::debug!("listening on {}", addr);
@@ -113,7 +113,7 @@ async fn dial_and_listen() {
         }
     });
 
-    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519());
+    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
     let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
     log::info!("dialing {}", dial_addr);
     let dial = dialer
@@ -140,4 +140,172 @@ async fn dial_and_listen() {
     assert!(res_listen.is_ok());
 
     log::info!("dial_and_listen test finished");
+}
+
+#[tokio::test]
+async fn dial_and_listen_with_certificate() {
+    let _ = env_logger::try_init();
+    log::info!("starting dial_and_listen_with_certificate test");
+
+    // 1. Generate and save a certificate and private key
+    let mut cert_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]);
+    cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    cert_params.not_before = time::OffsetDateTime::now_utc();
+    cert_params.not_after =
+        time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
+    let cert = rcgen::Certificate::from_params(cert_params).unwrap();
+    let cert_pem = cert.serialize_pem().unwrap();
+    let key_pem = cert.serialize_private_key_pem();
+    let cert_path = std::env::temp_dir().join("cert.pem");
+    let key_path = std::env::temp_dir().join("key.pem");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+
+    let id_keys = identity::Keypair::generate_ed25519();
+    let config = Config::Certificate {
+        certificate: cert_path.clone(),
+        private_key: key_path.clone(),
+    };
+    let mut listener = WebTransport::new(id_keys.clone(), config);
+
+    let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap();
+    log::debug!("listening on {}", addr);
+    listener.listen_on(ListenerId::next(), addr).unwrap();
+
+    log::debug!("polling for NewAddress event");
+    let listener_addr = match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
+        TransportEvent::NewAddress { listen_addr, .. } => listen_addr,
+        e => panic!("Expected NewAddress event, got {:?}", e),
+    };
+    log::info!("listener address: {}", listener_addr);
+
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        loop {
+            match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
+                TransportEvent::Incoming { upgrade, .. } => {
+                    let mut tx = tx.clone();
+                    tokio::spawn(async move {
+                        log::info!("upgrading incoming connection");
+                        let result = upgrade.await;
+                        log::info!("incoming upgrade finished: {:?}", result);
+                        tx.send(result).await.unwrap();
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
+    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
+    let dial = dialer
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::Reuse,
+            },
+        )
+        .unwrap();
+
+    let dial_task = tokio::spawn(dial);
+
+    let (res_dial, res_listen) = tokio::join!(dial_task, rx.next());
+    log::info!("join completed");
+    log::info!("dial task result: {:?}", res_dial);
+    log::info!("listen task result: {:?}", res_listen);
+
+    assert!(res_dial.is_ok(), "dial task failed");
+    let res_dial = res_dial.unwrap();
+    assert!(res_dial.is_ok(), "dial failed: {:?}", res_dial);
+    let res_listen = res_listen.unwrap();
+    assert!(res_listen.is_ok());
+
+    // Clean up the temporary files
+    std::fs::remove_file(&cert_path).unwrap();
+    std::fs::remove_file(&key_path).unwrap();
+
+    log::info!("dial_and_listen_with_certificate test finished");
+}
+
+#[tokio::test]
+async fn dial_and_listen_with_certificate_from_memory() {
+    let _ = env_logger::try_init();
+    log::info!("starting dial_and_listen_with_certificate_from_memory test");
+
+    // 1. Generate a certificate and private key
+    let mut cert_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]);
+    cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    cert_params.not_before = time::OffsetDateTime::now_utc();
+    cert_params.not_after =
+        time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
+    let cert = rcgen::Certificate::from_params(cert_params).unwrap();
+    let cert_pem = cert.serialize_pem().unwrap().as_bytes().to_vec();
+    let key_pem = cert.serialize_private_key_pem().as_bytes().to_vec();
+
+    let id_keys = identity::Keypair::generate_ed25519();
+    let config = Config::CertificateFromMemory {
+        certificate: cert_pem.clone(),
+        private_key: key_pem.clone(),
+    };
+    let mut listener = WebTransport::new(id_keys.clone(), config);
+
+    let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap();
+    log::debug!("listening on {}", addr);
+    listener.listen_on(ListenerId::next(), addr).unwrap();
+
+    log::debug!("polling for NewAddress event");
+    let listener_addr = match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
+        TransportEvent::NewAddress { listen_addr, .. } => listen_addr,
+        e => panic!("Expected NewAddress event, got {:?}", e),
+    };
+    log::info!("listener address: {}", listener_addr);
+
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        loop {
+            match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
+                TransportEvent::Incoming { upgrade, .. } => {
+                    let mut tx = tx.clone();
+                    tokio::spawn(async move {
+                        log::info!("upgrading incoming connection");
+                        let result = upgrade.await;
+                        log::info!("incoming upgrade finished: {:?}", result);
+                        tx.send(result).await.unwrap();
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
+    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
+    let dial = dialer
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::Reuse,
+            },
+        )
+        .unwrap();
+
+    let dial_task = tokio::spawn(dial);
+
+    let (res_dial, res_listen) = tokio::join!(dial_task, rx.next());
+    log::info!("join completed");
+    log::info!("dial task result: {:?}", res_dial);
+    log::info!("listen task result: {:?}", res_listen);
+
+    assert!(res_dial.is_ok(), "dial task failed");
+    let res_dial = res_dial.unwrap();
+    assert!(res_dial.is_ok(), "dial failed: {:?}", res_dial);
+    let res_listen = res_listen.unwrap();
+    assert!(res_listen.is_ok());
+
+    log::info!("dial_and_listen_with_certificate_from_memory test finished");
 }

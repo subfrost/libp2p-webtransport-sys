@@ -8,13 +8,13 @@
 //! # Usage
 //!
 //! ```
-//! use libp2p_webtransport_sys::transport::WebTransport;
+//! use libp2p_webtransport_sys::transport::{Config, WebTransport};
 //! use libp2p::identity;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let local_key = identity::Keypair::generate_ed25519();
-//!     let mut transport = WebTransport::new(local_key);
+//!     let mut transport = WebTransport::new(local_key, Config::SelfSigned);
 //! }
 //! ```
 
@@ -22,4 +22,4 @@ pub mod error;
 pub mod stream;
 pub mod transport;
 
-pub use transport::WebTransport;
+pub use transport::{Config, WebTransport};

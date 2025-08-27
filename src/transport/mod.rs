@@ -43,8 +43,10 @@ use multihash::Multihash;
 use multihash_codetable::Code;
 pub use multiaddr::WebTransportMultiaddr;
 use std::{
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
+    fs,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use sha2::{Digest, Sha256};
@@ -53,16 +55,29 @@ use wtransport::endpoint::{endpoint_side::Server, IncomingSession};
 /// The WebTransport transport.
 pub struct WebTransport {
     keypair: identity::Keypair,
+    config: Config,
     listeners: SelectAll<Listener>,
 }
 
-impl Clone for WebTransport {
-    fn clone(&self) -> Self {
-        Self {
-            keypair: self.keypair.clone(),
-            listeners: SelectAll::new(),
-        }
-    }
+/// WebTransport configuration.
+#[derive(Clone)]
+pub enum Config {
+    /// Use a self-signed certificate.
+    SelfSigned,
+    /// Use a pre-existing certificate chain and private key.
+    Certificate {
+        /// Path to the certificate chain in PEM format.
+        certificate: PathBuf,
+        /// Path to the private key in PEM format.
+        private_key: PathBuf,
+    },
+    /// Use a pre-existing certificate chain and private key from memory.
+    CertificateFromMemory {
+        /// Certificate chain in PEM format.
+        certificate: Vec<u8>,
+        /// Private key in PEM format.
+        private_key: Vec<u8>,
+    },
 }
 
 type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
@@ -70,9 +85,20 @@ type Output = (PeerId, StreamMuxerBox);
 
 impl WebTransport {
     /// Creates a new WebTransport transport.
-    pub fn new(keypair: identity::Keypair) -> Self {
+    pub fn new(keypair: identity::Keypair, config: Config) -> Self {
         Self {
             keypair,
+            config,
+            listeners: SelectAll::new(),
+        }
+    }
+}
+
+impl Clone for WebTransport {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            config: self.config.clone(),
             listeners: SelectAll::new(),
         }
     }
@@ -95,7 +121,8 @@ impl libp2p::Transport for WebTransport {
             .ok_or(libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr.clone())))?;
 
         let keypair = self.keypair.clone();
-        let listener = Listener::new(id, keypair, s_addr, addr)?;
+        let config = self.config.clone();
+        let listener = Listener::new(id, keypair, config, s_addr, addr)?;
         self.listeners.push(listener);
 
         Ok(())
@@ -152,7 +179,7 @@ impl libp2p::Transport for WebTransport {
             let conn = endpoint.connect(url).await?;
             log::debug!("wtransport connection established");
 
-            let (send, recv) = conn.open_bi().await?.await?;
+            let (send, recv) = conn.open_bi().await.map_err(Error::from)?.await.map_err(Error::from)?;
             log::debug!("opened bidirectional stream");
             let noise_stream = upgrader::NoiseStream {
                 recv: recv.compat(),
@@ -161,11 +188,11 @@ impl libp2p::Transport for WebTransport {
 
             let _remote_peer_id =
                 s_addr.remote_peer_id.ok_or(Error::MissingRemotePeerId)?;
-            let noise_config = noise::Config::new(&keypair)?;
+            let noise_config = noise::Config::new(&keypair).map_err(Error::Noise)?;
             log::debug!("performing noise handshake");
             let noise_upgrade = noise_config.upgrade_outbound(noise_stream, "l");
             futures::pin_mut!(noise_upgrade);
-            let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await?;
+            let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await.map_err(Error::Noise)?;
             log::debug!("noise handshake successful, peer_id={}", peer_id);
 
             Ok((
@@ -220,30 +247,50 @@ impl Listener {
     fn new(
         listener_id: ListenerId,
         keypair: identity::Keypair,
+        config: Config,
         s_addr: WebTransportMultiaddr,
         listen_addr: libp2p::Multiaddr,
     ) -> Result<Self, libp2p::core::transport::TransportError<Error>> {
-        let mut cert_params = rcgen::CertificateParams::new(vec![s_addr.host.clone()]);
-        cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-        cert_params.not_before = time::OffsetDateTime::now_utc();
-        cert_params.not_after = time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
-        let cert = rcgen::Certificate::from_params(cert_params).unwrap();
-        let cert_der = cert.serialize_der().unwrap();
-        let cert_hash = Sha256::digest(&cert_der);
-        let cert_hash =
-            Multihash::wrap(
-                Code::Sha2_256.into(),
-                &cert_hash,
-            )
-            .unwrap();
+        let (identity, cert_hash) = match config {
+            Config::SelfSigned => {
+                let mut cert_params = rcgen::CertificateParams::new(vec![s_addr.host.clone()]);
+                cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+                cert_params.not_before = time::OffsetDateTime::now_utc();
+                cert_params.not_after =
+                    time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
+                let cert = rcgen::Certificate::from_params(cert_params)
+                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string())))?;
+                let cert_der = cert.serialize_der().unwrap();
+                let cert_hash = Sha256::digest(&cert_der);
+                let cert_hash: Multihash<64> =
+                    Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
 
-        let identity = wtransport::Identity::new(
-            wtransport::tls::CertificateChain::new(vec![wtransport::tls::Certificate::from_der(
-                cert_der.into(),
-            )
-            .unwrap()]),
-            wtransport::tls::PrivateKey::from_der_pkcs8(cert.serialize_private_key_der().into()),
-        );
+                let identity = wtransport::Identity::new(
+                    wtransport::tls::CertificateChain::new(vec![
+                        wtransport::tls::Certificate::from_der(cert_der.into()).unwrap(),
+                    ]),
+                    wtransport::tls::PrivateKey::from_der_pkcs8(
+                        cert.serialize_private_key_der().into(),
+                    ),
+                );
+
+                (identity, cert_hash)
+            }
+            Config::Certificate {
+                certificate,
+                private_key,
+            } => {
+                let cert_data = fs::read(certificate)
+                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Io(e)))?;
+                let key_data = fs::read(private_key)
+                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Io(e)))?;
+                Self::create_identity(&cert_data, &key_data)?
+            }
+            Config::CertificateFromMemory {
+                certificate,
+                private_key,
+            } => Self::create_identity(&certificate, &private_key)?,
+        };
 
         let server_config = wtransport::ServerConfig::builder()
             .with_bind_default(s_addr.port)
@@ -251,7 +298,7 @@ impl Listener {
             .build();
 
         let endpoint = wtransport::Endpoint::server(server_config)
-            .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Transport(e)))?;
+            .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Endpoint(e.to_string())))?;
 
         let local_addr = endpoint.local_addr().unwrap();
         let listen_addr: libp2p::Multiaddr = listen_addr
@@ -277,6 +324,44 @@ impl Listener {
             pending_event,
             is_closed: false,
         })
+    }
+
+    fn create_identity(
+        cert_data: &[u8],
+        key_data: &[u8],
+    ) -> Result<
+        (wtransport::Identity, Multihash<64>),
+        libp2p::core::transport::TransportError<Error>,
+    > {
+        let certs = rustls_pemfile::certs(&mut &*cert_data)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string()))
+            })?;
+
+        let key = rustls_pemfile::private_key(&mut &*key_data)
+            .map_err(|e| {
+                libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string()))
+            })?
+            .ok_or_else(|| {
+                libp2p::core::transport::TransportError::Other(Error::Tls(
+                    "No private key found in PEM file".to_string(),
+                ))
+            })?;
+
+        let cert_hash = Sha256::digest(&certs[0]);
+        let cert_hash = Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
+        let identity = wtransport::Identity::new(
+            wtransport::tls::CertificateChain::new(
+                certs
+                    .into_iter()
+                    .map(|c| wtransport::tls::Certificate::from_der(c.to_vec()).unwrap())
+                    .collect(),
+            ),
+            wtransport::tls::PrivateKey::from_der_pkcs8(key.secret_der().to_vec()),
+        );
+
+        Ok((identity, cert_hash))
     }
 
     fn close(&mut self) {
@@ -348,22 +433,22 @@ impl Stream for Listener {
 
                     let upgrade: ListenerUpgrade = Box::pin(async move {
                         log::trace!("starting upgrade for incoming connection");
-                        let session_request = incoming_session.await?;
+                        let session_request = incoming_session.await.map_err(Error::from)?;
                         log::trace!("accepted session request");
-                        let conn = session_request.accept().await?;
+                        let conn = session_request.accept().await.map_err(Error::from)?;
                         log::trace!("accepted connection");
-                        let (send, recv) = conn.accept_bi().await?;
+                        let (send, recv) = conn.accept_bi().await.map_err(Error::from)?;
                         log::trace!("accepted bidirectional stream");
                         let noise_stream = upgrader::NoiseStream {
                             recv: recv.compat(),
                             send: send.compat_write(),
                         };
 
-                        let noise_config = noise::Config::new(&keypair)?;
+                        let noise_config = noise::Config::new(&keypair).map_err(Error::Noise)?;
                         log::trace!("performing noise handshake");
                         let noise_upgrade = noise_config.upgrade_inbound(noise_stream, "");
                         futures::pin_mut!(noise_upgrade);
-                        let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await?;
+                        let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await.map_err(Error::Noise)?;
                         log::debug!("noise handshake successful, peer_id={}", peer_id);
 
                         let muxer = crate::stream::Muxer::new(conn, None);
