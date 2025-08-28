@@ -126,7 +126,18 @@ async fn dial_and_listen() {
         }
     });
 
-    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
+    let certhash = get_certhash(&listener_addr);
+    let client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes(vec![wtransport::tls::Sha256Digest::new(
+            certhash.digest().try_into().unwrap(),
+        )])
+        .build();
+
+    let mut dialer = WebTransport::new(
+        identity::Keypair::generate_ed25519(),
+        Config::Client(client_config),
+    );
     let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
     log::info!("dialing {}", dial_addr);
     let dial = dialer
@@ -208,11 +219,24 @@ async fn dial_and_listen_with_certificate_from_memory() {
         }
     });
 
-    let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
-    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
+    let dial_addr = listener_addr
+        .clone()
+        .with(Protocol::P2p(id_keys.public().to_peer_id()));
+    let certhash = get_certhash(&listener_addr);
+    let client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes(vec![wtransport::tls::Sha256Digest::new(
+            certhash.digest().try_into().unwrap(),
+        )])
+        .build();
+
+    let mut dialer = WebTransport::new(
+        identity::Keypair::generate_ed25519(),
+        Config::Client(client_config),
+    );
     let dial = dialer
         .dial(
-            dial_addr,
+            dial_addr.clone(),
             DialOpts {
                 role: libp2p::core::Endpoint::Dialer,
                 port_use: libp2p::core::transport::PortUse::Reuse,
@@ -265,7 +289,14 @@ async fn dial_and_listen_with_ec_key() {
     // 4. Set up dialer transport
     let dialer_keypair = identity::Keypair::generate_ed25519();
     let dialer_peer_id = dialer_keypair.public().to_peer_id();
-    let mut dialer_transport = WebTransport::new(dialer_keypair, Config::SelfSigned);
+    let client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes(vec![wtransport::tls::Sha256Digest::new(
+            certhash.digest().try_into().unwrap(),
+        )])
+        .build();
+    let mut dialer_transport =
+        WebTransport::new(dialer_keypair, Config::Client(client_config));
 
     // 5. Spawn listener task
     tokio::spawn(async move {
@@ -304,6 +335,9 @@ async fn dial_and_listen_with_ec_key() {
 fn generate_ec_cert_and_key() -> rcgen::Certificate {
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]);
     params.alg = &rcgen::PKCS_ECDSA_P256_SHA256; // Use an EC algorithm
+    params.not_before = time::OffsetDateTime::now_utc();
+    params.not_after =
+        time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
     rcgen::Certificate::from_params(params).unwrap()
 }
 
@@ -383,53 +417,43 @@ async fn dial_with_custom_client_config() {
         }
     }
 
-    // 2. Generate the server's self-signed certificate in the test
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert_der = cert.serialize_der().unwrap();
-    let cert_pem = cert.serialize_pem().unwrap();
-    let private_key_pem = cert.serialize_private_key_pem();
-    let cert_hash: [u8; 32] = sha2::Sha256::digest(&cert_der).into();
-
-    // 3. Build a custom rustls::ClientConfig
-    let client_tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(CustomVerifier {
-            trusted_cert_hash: cert_hash.into(),
-        }))
-        .with_no_client_auth();
-
-    // 4. Build a wtransport::ClientConfig
-    let wtransport_client_config = wtransport::ClientConfig::builder()
-        .with_bind_default()
-        .with_custom_tls(client_tls_config)
-        .build();
-
-    // 5. Create the libp2p transport using the new API
-    let client_keypair = identity::Keypair::generate_ed25519();
-    let mut client_transport = WebTransport::new(
-        client_keypair,
-        Config::Client(std::sync::Arc::new(wtransport_client_config)),
-    );
-
-    // 6. Create the server transport
+    // 2. Create the server transport. It will generate a self-signed certificate.
     let server_keypair = identity::Keypair::generate_ed25519();
     let server_peer_id = server_keypair.public().to_peer_id();
-    let mut server_transport = WebTransport::new(
-        server_keypair,
-        Config::CertificateFromMemory {
-            certificate: cert_pem.as_bytes().to_vec(),
-            private_key: private_key_pem.as_bytes().to_vec(),
-        },
-    );
+    let mut server_transport = WebTransport::new(server_keypair, Config::SelfSigned);
 
-    // 7. Start listening
+    // 3. Start listening and get the address with the generated certhash.
     let addr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
         .parse()
         .unwrap();
     server_transport.listen_on(ListenerId::next(), addr).unwrap();
     let listen_addr = wait_for_listen_addr(&mut server_transport).await;
+    let certhash = get_certhash(&listen_addr);
 
-    // 8. Spawn listener task
+    // 4. Build a custom rustls::ClientConfig using the extracted certhash.
+    let mut client_tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(CustomVerifier {
+            trusted_cert_hash: certhash.digest().try_into().unwrap(),
+        }))
+        .with_no_client_auth();
+
+    client_tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    // 5. Build a wtransport::ClientConfig
+    let wtransport_client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls(client_tls_config)
+        .build();
+
+    // 6. Create the client libp2p transport
+    let client_keypair = identity::Keypair::generate_ed25519();
+    let mut client_transport = WebTransport::new(
+        client_keypair,
+        Config::Client(wtransport_client_config),
+    );
+
+    // 7. Spawn listener task
     tokio::spawn(async move {
         loop {
             if let TransportEvent::Incoming { upgrade, .. } =
@@ -441,7 +465,7 @@ async fn dial_with_custom_client_config() {
         }
     });
 
-    // 9. Dial the listener
+    // 8. Dial the listener
     let dial_addr = listen_addr.with(Protocol::P2p(server_peer_id));
     client_transport
         .dial(

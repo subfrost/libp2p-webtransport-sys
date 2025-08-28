@@ -22,7 +22,6 @@ pub mod multiaddr;
 /// [`ConnectionUpgrader`](libp2p_core::upgrade::ConnectionUpgrader) specific logic.
 pub mod upgrader;
 
-use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use crate::error::Error;
 use async_trait::async_trait;
 use futures::{
@@ -45,77 +44,21 @@ use multihash_codetable::Code;
 pub use multiaddr::WebTransportMultiaddr;
 use std::{
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use sha2::{Digest, Sha256};
 use wtransport::endpoint::{endpoint_side::Server, IncomingSession};
 
-#[derive(Debug)]
-struct WebTransportServerVerifier {
-    hashes: Vec<wtransport::tls::Sha256Digest>,
-}
-
-impl WebTransportServerVerifier {
-    fn new(hashes: Vec<wtransport::tls::Sha256Digest>) -> Self {
-        Self { hashes }
-    }
-}
-
-impl ServerCertVerifier for WebTransportServerVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let cert_hash = Sha256::digest(end_entity.as_ref());
-        let cert_hash = wtransport::tls::Sha256Digest::new(cert_hash.into());
-
-        if self.hashes.contains(&cert_hash) {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-        ]
-    }
-}
 
 /// The WebTransport transport.
+#[derive(Debug)]
 pub struct WebTransport {
     keypair: identity::Keypair,
     config: Config,
     listeners: SelectAll<Listener>,
-    endpoint: Option<Arc<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>>>,
+    endpoint: Option<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>>,
+    server_cert_hashes: Vec<wtransport::tls::Sha256Digest>,
 }
 
 impl Clone for WebTransport {
@@ -125,12 +68,13 @@ impl Clone for WebTransport {
             config: self.config.clone(),
             listeners: SelectAll::new(),
             endpoint: self.endpoint.clone(),
+            server_cert_hashes: self.server_cert_hashes.clone(),
         }
     }
 }
 
 /// WebTransport configuration.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Config {
     /// Use a self-signed certificate.
     SelfSigned,
@@ -142,17 +86,7 @@ pub enum Config {
         private_key: Vec<u8>,
     },
     /// The transport will be configured as a client using the provided TLS configuration.
-    Client(Arc<wtransport::ClientConfig>),
-}
-
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SelfSigned => write!(f, "SelfSigned"),
-            Self::CertificateFromMemory { .. } => write!(f, "CertificateFromMemory"),
-            Self::Client(_) => write!(f, "Client"),
-        }
-    }
+    Client(wtransport::ClientConfig),
 }
 
 type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
@@ -162,10 +96,7 @@ impl WebTransport {
     /// Creates a new WebTransport transport.
     pub fn new(keypair: identity::Keypair, config: Config) -> Self {
         let endpoint = if let Config::Client(client_config) = &config {
-            let client_config = Arc::try_unwrap(client_config.clone()).unwrap();
-            Some(Arc::new(
-                wtransport::Endpoint::client(client_config).unwrap(),
-            ))
+            Some(wtransport::Endpoint::client(client_config.clone()).unwrap())
         } else {
             None
         };
@@ -175,6 +106,7 @@ impl WebTransport {
             config,
             listeners: SelectAll::new(),
             endpoint,
+            server_cert_hashes: Vec::new(),
         }
     }
 }
@@ -197,6 +129,8 @@ impl libp2p::Transport for WebTransport {
 
         let keypair = self.keypair.clone();
         let listener = Listener::new(id, keypair, &self.config, s_addr, addr)?;
+        self.server_cert_hashes
+            .push(listener.server_cert_hash().clone());
         self.listeners.push(listener);
 
         Ok(())
@@ -217,53 +151,24 @@ impl libp2p::Transport for WebTransport {
         _opts: DialOpts,
     ) -> Result<Self::Dial, libp2p::core::transport::TransportError<Self::Error>> {
         log::debug!("dialing {}", addr);
+
+        if self.endpoint.is_none() {
+            let client_config = wtransport::ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes(self.server_cert_hashes.clone())
+                .build();
+            self.endpoint = Some(wtransport::Endpoint::client(client_config).unwrap());
+        }
+
         let s_addr = WebTransportMultiaddr::from_dial_multiaddr(&addr).ok_or(
             libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr)),
         )?;
 
         let keypair = self.keypair.clone();
-        let keypair = self.keypair.clone();
-        let endpoint = self.endpoint.clone();
+        let endpoint = self.endpoint.clone().unwrap();
 
         Ok(Box::pin(async move {
             log::trace!("dialer task started");
-
-            let endpoint = if let Some(endpoint) = endpoint {
-                endpoint
-            } else {
-                let hashes = s_addr
-                    .certhashes
-                    .clone()
-                    .into_iter()
-                    .map(|mh| {
-                        mh.digest()
-                            .try_into()
-                            .map(wtransport::tls::Sha256Digest::new)
-                            .map_err(|_| Error::InvalidCerthash)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                log::debug!("dialing with certhashes: {:?}", hashes);
-                let root_store = rustls::RootCertStore::empty();
-                let mut client_config = rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth();
-
-                client_config
-                    .dangerous()
-                    .set_certificate_verifier(std::sync::Arc::new(
-                        WebTransportServerVerifier::new(hashes),
-                    ));
-
-                client_config.alpn_protocols = vec![b"h3".to_vec()];
-
-                let client_config = wtransport::ClientConfig::builder()
-                    .with_bind_default()
-                    .with_custom_tls(client_config)
-                    .build();
-
-                Arc::new(wtransport::Endpoint::client(client_config).unwrap())
-            };
 
             let url = format!(
                 "https://{}:{}/.well-known/libp2p-webtransport",
@@ -284,14 +189,14 @@ impl libp2p::Transport for WebTransport {
                 s_addr.remote_peer_id.ok_or(Error::MissingRemotePeerId)?;
             let noise_config = noise::Config::new(&keypair).map_err(Error::Noise)?;
             log::debug!("performing noise handshake");
-            let noise_upgrade = noise_config.upgrade_outbound(noise_stream, "l");
+            let noise_upgrade = noise_config.upgrade_outbound(noise_stream, "");
             futures::pin_mut!(noise_upgrade);
             let (peer_id, _noise_output) = futures::future::poll_fn(|cx| noise_upgrade.as_mut().poll(cx)).await.map_err(Error::Noise)?;
             log::debug!("noise handshake successful, peer_id={}", peer_id);
 
             Ok((
                 peer_id,
-                StreamMuxerBox::new(crate::stream::Muxer::new(conn, Some(endpoint.clone()))),
+                StreamMuxerBox::new(crate::stream::Muxer::new(conn, Some(endpoint.into()))),
             ))
         }))
     }
@@ -335,9 +240,13 @@ struct Listener {
     accept_fut: Option<AcceptFuture>,
     pending_event: Option<TransportEvent<ListenerUpgrade, Error>>,
     is_closed: bool,
+    server_cert_hash: wtransport::tls::Sha256Digest,
 }
 
 impl Listener {
+    pub fn server_cert_hash(&self) -> &wtransport::tls::Sha256Digest {
+        &self.server_cert_hash
+    }
     fn new(
         listener_id: ListenerId,
         keypair: identity::Keypair,
@@ -347,33 +256,19 @@ impl Listener {
     ) -> Result<Self, libp2p::core::transport::TransportError<Error>> {
         let (identity, cert_hash) = match config {
             Config::SelfSigned => {
-                let mut cert_params = rcgen::CertificateParams::new(vec![s_addr.host.clone()]);
-                cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-                cert_params.not_before = time::OffsetDateTime::now_utc();
-                cert_params.not_after =
-                    time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
-                let cert = rcgen::Certificate::from_params(cert_params)
-                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string())))?;
-                let cert_der = cert.serialize_der().unwrap();
-                let cert_hash = Sha256::digest(&cert_der);
-                let cert_hash: Multihash<64> =
-                    Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
-
-                let identity = wtransport::Identity::new(
-                    wtransport::tls::CertificateChain::new(vec![
-                        wtransport::tls::Certificate::from_der(cert_der.into()).unwrap(),
-                    ]),
-                    wtransport::tls::PrivateKey::from_der_pkcs8(
-                        cert.serialize_private_key_der().into(),
-                    ),
-                );
-
+                let identity = wtransport::Identity::self_signed([s_addr.host.clone()]).unwrap();
+                let cert_der = identity.certificate_chain().as_slice()[0].der();
+                let cert_hash = Sha256::digest(cert_der);
+                let cert_hash = Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
                 (identity, cert_hash)
             }
             Config::CertificateFromMemory {
                 certificate,
                 private_key,
-            } => Self::create_identity(&certificate, &private_key)?,
+            } => {
+                let (identity, cert_hash) = Self::create_identity(certificate, private_key)?;
+                (identity, cert_hash)
+            }
             Config::Client(_) => {
                 return Err(libp2p::core::transport::TransportError::Other(
                     Error::WrongConfig,
@@ -381,9 +276,12 @@ impl Listener {
             }
         };
 
+        let server_cert_hash =
+            wtransport::tls::Sha256Digest::new(cert_hash.digest().try_into().unwrap());
+
         let server_config = wtransport::ServerConfig::builder()
             .with_bind_default(s_addr.port)
-            .with_identity(identity)
+            .with_identity(identity.clone_identity())
             .build();
 
         let endpoint = wtransport::Endpoint::server(server_config)
@@ -412,6 +310,7 @@ impl Listener {
             accept_fut: None,
             pending_event,
             is_closed: false,
+            server_cert_hash,
         })
     }
 
@@ -467,6 +366,19 @@ impl Listener {
             reason: Ok(()),
         });
         self.is_closed = true;
+    }
+}
+
+impl std::fmt::Debug for Listener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listener")
+            .field("listener_id", &self.listener_id)
+            .field("endpoint", &self.endpoint)
+            .field("listen_addr", &self.listen_addr)
+            .field("accept_fut", &"Option<AcceptFuture>")
+            .field("pending_event", &self.pending_event)
+            .field("is_closed", &self.is_closed)
+            .finish()
     }
 }
 
