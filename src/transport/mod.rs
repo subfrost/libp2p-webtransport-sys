@@ -22,6 +22,7 @@ pub mod multiaddr;
 /// [`ConnectionUpgrader`](libp2p_core::upgrade::ConnectionUpgrader) specific logic.
 pub mod upgrader;
 
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use crate::error::Error;
 use async_trait::async_trait;
 use futures::{
@@ -51,6 +52,64 @@ use std::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use sha2::{Digest, Sha256};
 use wtransport::endpoint::{endpoint_side::Server, IncomingSession};
+
+#[derive(Debug)]
+struct WebTransportServerVerifier {
+    hashes: Vec<wtransport::tls::Sha256Digest>,
+}
+
+impl WebTransportServerVerifier {
+    fn new(hashes: Vec<wtransport::tls::Sha256Digest>) -> Self {
+        Self { hashes }
+    }
+}
+
+impl ServerCertVerifier for WebTransportServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert_hash = Sha256::digest(end_entity.as_ref());
+        let cert_hash = wtransport::tls::Sha256Digest::new(cert_hash.into());
+
+        if self.hashes.contains(&cert_hash) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+        ]
+    }
+}
 
 /// The WebTransport transport.
 pub struct WebTransport {
@@ -165,9 +224,21 @@ impl libp2p::Transport for WebTransport {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            log::debug!("dialing with certhashes: {:?}", hashes);
+            let mut root_store = rustls::RootCertStore::empty();
+            let mut client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            
+            client_config
+                .dangerous()
+                .set_certificate_verifier(std::sync::Arc::new(WebTransportServerVerifier::new(hashes)));
+            
+            client_config.alpn_protocols = vec![b"h3".to_vec()];
+
             let client_config = wtransport::ClientConfig::builder()
                 .with_bind_default()
-                .with_server_certificate_hashes(hashes)
+                .with_custom_tls(client_config)
                 .build();
 
             let endpoint = wtransport::Endpoint::client(client_config).unwrap();
@@ -339,6 +410,9 @@ impl Listener {
                 libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string()))
             })?;
 
+        // This is the crucial part. `rustls_pemfile::private_key` parses various formats
+        // (PKCS#1, SEC1, PKCS#8), and `.secret_der()` converts them to a PKCS#8 byte vector,
+        // which is what `wtransport` expects.
         let key = rustls_pemfile::private_key(&mut &*key_data)
             .map_err(|e| {
                 libp2p::core::transport::TransportError::Other(Error::Tls(e.to_string()))
@@ -351,6 +425,7 @@ impl Listener {
 
         let cert_hash = Sha256::digest(&certs[0]);
         let cert_hash = Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
+        log::debug!("created certhash: {:?}", cert_hash);
         let identity = wtransport::Identity::new(
             wtransport::tls::CertificateChain::new(
                 certs

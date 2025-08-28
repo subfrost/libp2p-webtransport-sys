@@ -17,6 +17,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 rcgen = "0.11.1"
 time = { version = "0.3", features = ["std", "serde"] }
 rustls-pemfile = "2.1.0"
+rustls-pki-types = { version = "1.12.0", features = ["alloc"] }
+rustls = "0.23.10"
+webpki-roots = "0.26.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 async-trait = "0.1.73"
 log = "0.4"

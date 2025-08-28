@@ -11,11 +11,23 @@ use libp2p::{
     Transport,
 };
 use libp2p_webtransport_sys::transport::{Config, WebTransport};
-use std::pin::Pin;
+use multihash::Multihash;
+use std::{pin::Pin, sync::Once};
+
+static INIT: Once = Once::new();
+
+fn init() {
+    INIT.call_once(|| {
+        let _ = env_logger::try_init();
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .unwrap();
+    });
+}
 
 #[tokio::test]
 async fn close_listener() {
-    let _ = env_logger::try_init();
+    init();
     let id_keys = identity::Keypair::generate_ed25519();
     let mut transport = WebTransport::new(id_keys, Config::SelfSigned);
 
@@ -78,7 +90,7 @@ async fn close_listener() {
 
 #[tokio::test]
 async fn dial_and_listen() {
-    let _ = env_logger::try_init();
+    init();
     log::info!("starting dial_and_listen test");
     let id_keys = identity::Keypair::generate_ed25519();
     let mut listener = WebTransport::new(id_keys.clone(), Config::SelfSigned);
@@ -144,7 +156,7 @@ async fn dial_and_listen() {
 
 #[tokio::test]
 async fn dial_and_listen_with_certificate() {
-    let _ = env_logger::try_init();
+    init();
     log::info!("starting dial_and_listen_with_certificate test");
 
     // 1. Generate and save a certificate and private key
@@ -232,7 +244,7 @@ async fn dial_and_listen_with_certificate() {
 
 #[tokio::test]
 async fn dial_and_listen_with_certificate_from_memory() {
-    let _ = env_logger::try_init();
+    init();
     log::info!("starting dial_and_listen_with_certificate_from_memory test");
 
     // 1. Generate a certificate and private key
@@ -308,4 +320,94 @@ async fn dial_and_listen_with_certificate_from_memory() {
     assert!(res_listen.is_ok());
 
     log::info!("dial_and_listen_with_certificate_from_memory test finished");
+}
+
+#[tokio::test]
+async fn dial_and_listen_with_ec_key() {
+    init();
+
+    // 1. Generate EC key and certificate
+    let cert = generate_ec_cert_and_key();
+
+    // 2. Set up listener transport with the new cert/key from memory
+    let listener_keypair = identity::Keypair::generate_ed25519();
+    let listener_peer_id = listener_keypair.public().to_peer_id();
+    let mut listener_transport = WebTransport::new(
+        listener_keypair,
+        Config::CertificateFromMemory {
+            certificate: cert.serialize_pem().unwrap().as_bytes().to_vec(),
+            private_key: cert.serialize_private_key_pem().as_bytes().to_vec(),
+        },
+    );
+
+    // 3. Start listening
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
+        .parse()
+        .unwrap();
+    listener_transport.listen_on(ListenerId::next(), addr).unwrap();
+    let listen_addr = wait_for_listen_addr(&mut listener_transport).await;
+    let certhash = get_certhash(&listen_addr);
+
+    // 4. Set up dialer transport
+    let dialer_keypair = identity::Keypair::generate_ed25519();
+    let dialer_peer_id = dialer_keypair.public().to_peer_id();
+    let mut dialer_transport = WebTransport::new(dialer_keypair, Config::SelfSigned);
+
+    // 5. Spawn listener task
+    tokio::spawn(async move {
+        loop {
+            match poll_fn(|cx| Pin::new(&mut listener_transport).as_mut().poll(cx)).await {
+                TransportEvent::Incoming { upgrade, .. } => {
+                    let (peer, _muxer) = upgrade.await.unwrap();
+                    assert_eq!(peer, dialer_peer_id);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        
+        
+    });
+
+    // 6. Dial the listener
+    let dial_addr = listen_addr
+        .with(Protocol::P2p(listener_peer_id))
+        .with(Protocol::Certhash(certhash));
+    let (_peer, _muxer) = dialer_transport
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::Reuse,
+            },
+        )
+        .unwrap()
+        .await
+        .unwrap();
+}
+
+// Helper function to generate EC certificate and key
+fn generate_ec_cert_and_key() -> rcgen::Certificate {
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]);
+    params.alg = &rcgen::PKCS_ECDSA_P256_SHA256; // Use an EC algorithm
+    rcgen::Certificate::from_params(params).unwrap()
+}
+
+async fn wait_for_listen_addr(transport: &mut WebTransport) -> Multiaddr {
+    loop {
+        match poll_fn(|cx| Pin::new(&mut *transport).as_mut().poll(cx)).await {
+            TransportEvent::NewAddress { listen_addr, .. } => return listen_addr,
+            _ => {}
+        }
+    }
+}
+
+fn get_certhash(addr: &Multiaddr) -> Multihash<64> {
+    let mut certhash = None;
+    for p in addr.iter() {
+        if let Protocol::Certhash(hash) = p {
+            certhash = Some(hash);
+        }
+    }
+    certhash.unwrap()
 }
