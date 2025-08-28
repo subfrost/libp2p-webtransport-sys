@@ -44,10 +44,9 @@ use multihash::Multihash;
 use multihash_codetable::Code;
 pub use multiaddr::WebTransportMultiaddr;
 use std::{
-    path::PathBuf,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
-    fs,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use sha2::{Digest, Sha256};
@@ -116,41 +115,7 @@ pub struct WebTransport {
     keypair: identity::Keypair,
     config: Config,
     listeners: SelectAll<Listener>,
-}
-
-/// WebTransport configuration.
-#[derive(Clone)]
-pub enum Config {
-    /// Use a self-signed certificate.
-    SelfSigned,
-    /// Use a pre-existing certificate chain and private key.
-    Certificate {
-        /// Path to the certificate chain in PEM format.
-        certificate: PathBuf,
-        /// Path to the private key in PEM format.
-        private_key: PathBuf,
-    },
-    /// Use a pre-existing certificate chain and private key from memory.
-    CertificateFromMemory {
-        /// Certificate chain in PEM format.
-        certificate: Vec<u8>,
-        /// Private key in PEM format.
-        private_key: Vec<u8>,
-    },
-}
-
-type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
-type Output = (PeerId, StreamMuxerBox);
-
-impl WebTransport {
-    /// Creates a new WebTransport transport.
-    pub fn new(keypair: identity::Keypair, config: Config) -> Self {
-        Self {
-            keypair,
-            config,
-            listeners: SelectAll::new(),
-        }
-    }
+    endpoint: Option<Arc<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>>>,
 }
 
 impl Clone for WebTransport {
@@ -159,6 +124,57 @@ impl Clone for WebTransport {
             keypair: self.keypair.clone(),
             config: self.config.clone(),
             listeners: SelectAll::new(),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+}
+
+/// WebTransport configuration.
+#[derive(Clone)]
+pub enum Config {
+    /// Use a self-signed certificate.
+    SelfSigned,
+    /// Use a pre-existing certificate chain and private key from memory.
+    CertificateFromMemory {
+        /// Certificate chain in PEM format.
+        certificate: Vec<u8>,
+        /// Private key in PEM format.
+        private_key: Vec<u8>,
+    },
+    /// The transport will be configured as a client using the provided TLS configuration.
+    Client(Arc<wtransport::ClientConfig>),
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfSigned => write!(f, "SelfSigned"),
+            Self::CertificateFromMemory { .. } => write!(f, "CertificateFromMemory"),
+            Self::Client(_) => write!(f, "Client"),
+        }
+    }
+}
+
+type ListenerUpgrade = Pin<Box<dyn Future<Output = Result<Output, Error>> + Send>>;
+type Output = (PeerId, StreamMuxerBox);
+
+impl WebTransport {
+    /// Creates a new WebTransport transport.
+    pub fn new(keypair: identity::Keypair, config: Config) -> Self {
+        let endpoint = if let Config::Client(client_config) = &config {
+            let client_config = Arc::try_unwrap(client_config.clone()).unwrap();
+            Some(Arc::new(
+                wtransport::Endpoint::client(client_config).unwrap(),
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            keypair,
+            config,
+            listeners: SelectAll::new(),
+            endpoint,
         }
     }
 }
@@ -180,8 +196,7 @@ impl libp2p::Transport for WebTransport {
             .ok_or(libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr.clone())))?;
 
         let keypair = self.keypair.clone();
-        let config = self.config.clone();
-        let listener = Listener::new(id, keypair, config, s_addr, addr)?;
+        let listener = Listener::new(id, keypair, &self.config, s_addr, addr)?;
         self.listeners.push(listener);
 
         Ok(())
@@ -207,41 +222,49 @@ impl libp2p::Transport for WebTransport {
         )?;
 
         let keypair = self.keypair.clone();
+        let keypair = self.keypair.clone();
+        let endpoint = self.endpoint.clone();
 
         Ok(Box::pin(async move {
             log::trace!("dialer task started");
 
+            let endpoint = if let Some(endpoint) = endpoint {
+                endpoint
+            } else {
+                let hashes = s_addr
+                    .certhashes
+                    .clone()
+                    .into_iter()
+                    .map(|mh| {
+                        mh.digest()
+                            .try_into()
+                            .map(wtransport::tls::Sha256Digest::new)
+                            .map_err(|_| Error::InvalidCerthash)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-            let hashes = s_addr
-                .certhashes
-                .clone()
-                .into_iter()
-                .map(|mh| {
-                    mh.digest()
-                        .try_into()
-                        .map(wtransport::tls::Sha256Digest::new)
-                        .map_err(|_| Error::InvalidCerthash)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                log::debug!("dialing with certhashes: {:?}", hashes);
+                let root_store = rustls::RootCertStore::empty();
+                let mut client_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
 
-            log::debug!("dialing with certhashes: {:?}", hashes);
-            let mut root_store = rustls::RootCertStore::empty();
-            let mut client_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            
-            client_config
-                .dangerous()
-                .set_certificate_verifier(std::sync::Arc::new(WebTransportServerVerifier::new(hashes)));
-            
-            client_config.alpn_protocols = vec![b"h3".to_vec()];
+                client_config
+                    .dangerous()
+                    .set_certificate_verifier(std::sync::Arc::new(
+                        WebTransportServerVerifier::new(hashes),
+                    ));
 
-            let client_config = wtransport::ClientConfig::builder()
-                .with_bind_default()
-                .with_custom_tls(client_config)
-                .build();
+                client_config.alpn_protocols = vec![b"h3".to_vec()];
 
-            let endpoint = wtransport::Endpoint::client(client_config).unwrap();
+                let client_config = wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_custom_tls(client_config)
+                    .build();
+
+                Arc::new(wtransport::Endpoint::client(client_config).unwrap())
+            };
+
             let url = format!(
                 "https://{}:{}/.well-known/libp2p-webtransport",
                 s_addr.host, s_addr.port
@@ -268,7 +291,7 @@ impl libp2p::Transport for WebTransport {
 
             Ok((
                 peer_id,
-                StreamMuxerBox::new(crate::stream::Muxer::new(conn, Some(endpoint))),
+                StreamMuxerBox::new(crate::stream::Muxer::new(conn, Some(endpoint.clone()))),
             ))
         }))
     }
@@ -318,7 +341,7 @@ impl Listener {
     fn new(
         listener_id: ListenerId,
         keypair: identity::Keypair,
-        config: Config,
+        config: &Config,
         s_addr: WebTransportMultiaddr,
         listen_addr: libp2p::Multiaddr,
     ) -> Result<Self, libp2p::core::transport::TransportError<Error>> {
@@ -347,20 +370,15 @@ impl Listener {
 
                 (identity, cert_hash)
             }
-            Config::Certificate {
-                certificate,
-                private_key,
-            } => {
-                let cert_data = fs::read(certificate)
-                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Io(e)))?;
-                let key_data = fs::read(private_key)
-                    .map_err(|e| libp2p::core::transport::TransportError::Other(Error::Io(e)))?;
-                Self::create_identity(&cert_data, &key_data)?
-            }
             Config::CertificateFromMemory {
                 certificate,
                 private_key,
             } => Self::create_identity(&certificate, &private_key)?,
+            Config::Client(_) => {
+                return Err(libp2p::core::transport::TransportError::Other(
+                    Error::WrongConfig,
+                ))
+            }
         };
 
         let server_config = wtransport::ServerConfig::builder()

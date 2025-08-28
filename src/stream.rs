@@ -8,6 +8,7 @@ use libp2p::core::muxing::{StreamMuxer, StreamMuxerEvent};
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -20,14 +21,14 @@ use wtransport::{
 /// A stream muxer for WebTransport connections.
 pub struct Muxer {
     conn: Connection,
-    endpoint: Option<wtransport::Endpoint<Client>>,
+    endpoint: Option<Arc<wtransport::Endpoint<Client>>>,
     inbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), wtransport::error::ConnectionError>> + Send + 'static>>>,
     outbound_fut: Option<Pin<Box<dyn Future<Output = Result<(SendStream, RecvStream), io::Error>> + Send + 'static>>>,
 }
 
 impl Muxer {
     /// Creates a new `Muxer`.
-    pub fn new(conn: Connection, endpoint: Option<wtransport::Endpoint<Client>>) -> Self {
+    pub fn new(conn: Connection, endpoint: Option<Arc<wtransport::Endpoint<Client>>>) -> Self {
         Self {
             conn,
             endpoint,

@@ -12,6 +12,7 @@ use libp2p::{
 };
 use libp2p_webtransport_sys::transport::{Config, WebTransport};
 use multihash::Multihash;
+use sha2::Digest;
 use std::{pin::Pin, sync::Once};
 
 static INIT: Once = Once::new();
@@ -154,93 +155,6 @@ async fn dial_and_listen() {
     log::info!("dial_and_listen test finished");
 }
 
-#[tokio::test]
-async fn dial_and_listen_with_certificate() {
-    init();
-    log::info!("starting dial_and_listen_with_certificate test");
-
-    // 1. Generate and save a certificate and private key
-    let mut cert_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]);
-    cert_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-    cert_params.not_before = time::OffsetDateTime::now_utc();
-    cert_params.not_after =
-        time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60 * 60 * 24 * 7);
-    let cert = rcgen::Certificate::from_params(cert_params).unwrap();
-    let cert_pem = cert.serialize_pem().unwrap();
-    let key_pem = cert.serialize_private_key_pem();
-    let cert_path = std::env::temp_dir().join("cert.pem");
-    let key_path = std::env::temp_dir().join("key.pem");
-    std::fs::write(&cert_path, cert_pem).unwrap();
-    std::fs::write(&key_path, key_pem).unwrap();
-
-    let id_keys = identity::Keypair::generate_ed25519();
-    let config = Config::Certificate {
-        certificate: cert_path.clone(),
-        private_key: key_path.clone(),
-    };
-    let mut listener = WebTransport::new(id_keys.clone(), config);
-
-    let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport".parse().unwrap();
-    log::debug!("listening on {}", addr);
-    listener.listen_on(ListenerId::next(), addr).unwrap();
-
-    log::debug!("polling for NewAddress event");
-    let listener_addr = match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
-        TransportEvent::NewAddress { listen_addr, .. } => listen_addr,
-        e => panic!("Expected NewAddress event, got {:?}", e),
-    };
-    log::info!("listener address: {}", listener_addr);
-
-    let (tx, mut rx) = mpsc::channel(1);
-
-    tokio::spawn(async move {
-        loop {
-            match poll_fn(|cx| Pin::new(&mut listener).as_mut().poll(cx)).await {
-                TransportEvent::Incoming { upgrade, .. } => {
-                    let mut tx = tx.clone();
-                    tokio::spawn(async move {
-                        log::info!("upgrading incoming connection");
-                        let result = upgrade.await;
-                        log::info!("incoming upgrade finished: {:?}", result);
-                        tx.send(result).await.unwrap();
-                    });
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let dial_addr = listener_addr.with(Protocol::P2p(id_keys.public().to_peer_id()));
-    let mut dialer = WebTransport::new(identity::Keypair::generate_ed25519(), Config::SelfSigned);
-    let dial = dialer
-        .dial(
-            dial_addr,
-            DialOpts {
-                role: libp2p::core::Endpoint::Dialer,
-                port_use: libp2p::core::transport::PortUse::Reuse,
-            },
-        )
-        .unwrap();
-
-    let dial_task = tokio::spawn(dial);
-
-    let (res_dial, res_listen) = tokio::join!(dial_task, rx.next());
-    log::info!("join completed");
-    log::info!("dial task result: {:?}", res_dial);
-    log::info!("listen task result: {:?}", res_listen);
-
-    assert!(res_dial.is_ok(), "dial task failed");
-    let res_dial = res_dial.unwrap();
-    assert!(res_dial.is_ok(), "dial failed: {:?}", res_dial);
-    let res_listen = res_listen.unwrap();
-    assert!(res_listen.is_ok());
-
-    // Clean up the temporary files
-    std::fs::remove_file(&cert_path).unwrap();
-    std::fs::remove_file(&key_path).unwrap();
-
-    log::info!("dial_and_listen_with_certificate test finished");
-}
 
 #[tokio::test]
 async fn dial_and_listen_with_certificate_from_memory() {
@@ -410,4 +324,134 @@ fn get_certhash(addr: &Multiaddr) -> Multihash<64> {
         }
     }
     certhash.unwrap()
+}
+
+#[tokio::test]
+async fn dial_with_custom_client_config() {
+    init();
+
+    // 1. Define a custom verifier to trust a certificate by its hash
+    #[derive(Debug)]
+    struct CustomVerifier {
+        trusted_cert_hash: [u8; 32],
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for CustomVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            let cert_hash: [u8; 32] = sha2::Sha256::digest(end_entity.as_ref()).into();
+            if cert_hash == self.trusted_cert_hash {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    // 2. Generate the server's self-signed certificate in the test
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = cert.serialize_der().unwrap();
+    let cert_pem = cert.serialize_pem().unwrap();
+    let private_key_pem = cert.serialize_private_key_pem();
+    let cert_hash: [u8; 32] = sha2::Sha256::digest(&cert_der).into();
+
+    // 3. Build a custom rustls::ClientConfig
+    let client_tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(CustomVerifier {
+            trusted_cert_hash: cert_hash.into(),
+        }))
+        .with_no_client_auth();
+
+    // 4. Build a wtransport::ClientConfig
+    let wtransport_client_config = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_custom_tls(client_tls_config)
+        .build();
+
+    // 5. Create the libp2p transport using the new API
+    let client_keypair = identity::Keypair::generate_ed25519();
+    let mut client_transport = WebTransport::new(
+        client_keypair,
+        Config::Client(std::sync::Arc::new(wtransport_client_config)),
+    );
+
+    // 6. Create the server transport
+    let server_keypair = identity::Keypair::generate_ed25519();
+    let server_peer_id = server_keypair.public().to_peer_id();
+    let mut server_transport = WebTransport::new(
+        server_keypair,
+        Config::CertificateFromMemory {
+            certificate: cert_pem.as_bytes().to_vec(),
+            private_key: private_key_pem.as_bytes().to_vec(),
+        },
+    );
+
+    // 7. Start listening
+    let addr = "/ip4/127.0.0.1/udp/0/quic-v1/webtransport"
+        .parse()
+        .unwrap();
+    server_transport.listen_on(ListenerId::next(), addr).unwrap();
+    let listen_addr = wait_for_listen_addr(&mut server_transport).await;
+
+    // 8. Spawn listener task
+    tokio::spawn(async move {
+        loop {
+            if let TransportEvent::Incoming { upgrade, .. } =
+                poll_fn(|cx| Pin::new(&mut server_transport).as_mut().poll(cx)).await
+            {
+                upgrade.await.unwrap();
+                break;
+            }
+        }
+    });
+
+    // 9. Dial the listener
+    let dial_addr = listen_addr.with(Protocol::P2p(server_peer_id));
+    client_transport
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::Reuse,
+            },
+        )
+        .unwrap()
+        .await
+        .unwrap();
 }

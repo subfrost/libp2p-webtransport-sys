@@ -40,4 +40,7 @@ pub enum Error {
     /// An error occurred while creating the wtransport endpoint.
     #[error("Endpoint error: {0}")]
     Endpoint(String),
+    /// The configuration is not valid for the current operation.
+    #[error("Invalid configuration")]
+    WrongConfig,
 }
