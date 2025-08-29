@@ -521,16 +521,11 @@ impl ServerCertVerifier for WebTransportServerVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let cert_hash = Sha256::digest(end_entity.as_ref());
-        let cert_hash_w = wtransport::tls::Sha256Digest::new(cert_hash.into());
+        let cert_hash = wtransport::tls::Sha256Digest::new(cert_hash.into());
 
-        log::debug!("Verifier: received cert with hash: {:?}", cert_hash);
-        log::debug!("Verifier: expected one of hashes: {:?}", self.hashes);
-
-        if self.hashes.contains(&cert_hash_w) {
-            log::debug!("Verifier: SUCCESS, certificate hash matches");
+        if self.hashes.contains(&cert_hash) {
             Ok(ServerCertVerified::assertion())
         } else {
-            log::error!("Verifier: FAILED, certificate hash does not match");
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer,
             ))
