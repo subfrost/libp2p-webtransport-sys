@@ -1,6 +1,14 @@
 /*
     CHADSON'S JOURNAL
 
+    - 2025-08-29: Starting work on the certhash verification feature.
+    - The first step is to add the `WebTransportServerVerifier` struct. This struct will
+      implement `rustls::client::danger::ServerCertVerifier` to allow custom certificate
+      validation logic.
+    - The verifier will check the SHA-256 hash of the server's certificate against a list
+      of expected hashes provided in the multiaddress.
+    - This change is guided by the instructions in `prompt.txt`.
+
     - 2025-08-26: The user has approved the use of `unsafe` code.
     - The primary goal is to fix the `Listener::poll_next` implementation, which was previously
       re-creating the `accept()` future on every poll, causing the test to hang.
@@ -57,8 +65,6 @@ pub struct WebTransport {
     keypair: identity::Keypair,
     config: Config,
     listeners: SelectAll<Listener>,
-    endpoint: Option<wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>>,
-    server_cert_hashes: Vec<wtransport::tls::Sha256Digest>,
 }
 
 impl Clone for WebTransport {
@@ -67,8 +73,6 @@ impl Clone for WebTransport {
             keypair: self.keypair.clone(),
             config: self.config.clone(),
             listeners: SelectAll::new(),
-            endpoint: self.endpoint.clone(),
-            server_cert_hashes: self.server_cert_hashes.clone(),
         }
     }
 }
@@ -95,18 +99,10 @@ type Output = (PeerId, StreamMuxerBox);
 impl WebTransport {
     /// Creates a new WebTransport transport.
     pub fn new(keypair: identity::Keypair, config: Config) -> Self {
-        let endpoint = if let Config::Client(client_config) = &config {
-            Some(wtransport::Endpoint::client(client_config.clone()).unwrap())
-        } else {
-            None
-        };
-
         Self {
             keypair,
             config,
             listeners: SelectAll::new(),
-            endpoint,
-            server_cert_hashes: Vec::new(),
         }
     }
 }
@@ -129,8 +125,6 @@ impl libp2p::Transport for WebTransport {
 
         let keypair = self.keypair.clone();
         let listener = Listener::new(id, keypair, &self.config, s_addr, addr)?;
-        self.server_cert_hashes
-            .push(listener.server_cert_hash().clone());
         self.listeners.push(listener);
 
         Ok(())
@@ -152,22 +146,56 @@ impl libp2p::Transport for WebTransport {
     ) -> Result<Self::Dial, libp2p::core::transport::TransportError<Self::Error>> {
         log::debug!("dialing {}", addr);
 
-        if self.endpoint.is_none() {
-            let client_config = wtransport::ClientConfig::builder()
-                .with_bind_default()
-                .with_server_certificate_hashes(self.server_cert_hashes.clone())
-                .build();
-            self.endpoint = Some(wtransport::Endpoint::client(client_config).unwrap());
-        }
-
-        let s_addr = WebTransportMultiaddr::from_dial_multiaddr(&addr).ok_or(
-            libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr)),
-        )?;
+        let s_addr = WebTransportMultiaddr::from_dial_multiaddr(&addr).ok_or_else(|| {
+            libp2p::core::transport::TransportError::Other(Error::InvalidMultiaddr(addr))
+        })?;
 
         let keypair = self.keypair.clone();
-        let endpoint = self.endpoint.clone().unwrap();
 
         Ok(Box::pin(async move {
+            let hashes = s_addr
+                .certhashes
+                .clone()
+                .into_iter()
+                .map(|mh| {
+                    mh.digest()
+                        .try_into()
+                        .map(wtransport::tls::Sha256Digest::new)
+                        .map_err(|_| Error::InvalidCerthash)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let client_config = if !hashes.is_empty() {
+                // If certhashes are present, use the custom verifier
+                log::debug!("dialing with certhashes: {:?}", hashes);
+                let root_store = rustls::RootCertStore::empty(); // IMPORTANT: Do not use native roots
+                let mut client_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+
+                client_config
+                    .dangerous()
+                    .set_certificate_verifier(std::sync::Arc::new(WebTransportServerVerifier::new(
+                        hashes,
+                    )));
+
+                client_config.alpn_protocols = vec![b"h3".to_vec()];
+
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_custom_tls(client_config)
+                    .build()
+            } else {
+                // Otherwise, use default TLS validation
+                log::debug!("dialing without certhashes, using default TLS validation");
+                wtransport::ClientConfig::builder()
+                    .with_bind_default()
+                    .with_native_certs()
+                    .build()
+            };
+
+            let endpoint = wtransport::Endpoint::client(client_config).unwrap();
+
             log::trace!("dialer task started");
 
             let url = format!(
@@ -240,13 +268,9 @@ struct Listener {
     accept_fut: Option<AcceptFuture>,
     pending_event: Option<TransportEvent<ListenerUpgrade, Error>>,
     is_closed: bool,
-    server_cert_hash: wtransport::tls::Sha256Digest,
 }
 
 impl Listener {
-    pub fn server_cert_hash(&self) -> &wtransport::tls::Sha256Digest {
-        &self.server_cert_hash
-    }
     fn new(
         listener_id: ListenerId,
         keypair: identity::Keypair,
@@ -275,9 +299,6 @@ impl Listener {
                 ))
             }
         };
-
-        let server_cert_hash =
-            wtransport::tls::Sha256Digest::new(cert_hash.digest().try_into().unwrap());
 
         let server_config = wtransport::ServerConfig::builder()
             .with_bind_default(s_addr.port)
@@ -310,7 +331,6 @@ impl Listener {
             accept_fut: None,
             pending_event,
             is_closed: false,
-            server_cert_hash,
         })
     }
 
@@ -475,5 +495,71 @@ impl Stream for Listener {
                 }
             }
         }
+    }
+}
+
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+
+#[derive(Debug)]
+struct WebTransportServerVerifier {
+    hashes: Vec<wtransport::tls::Sha256Digest>,
+}
+
+impl WebTransportServerVerifier {
+    fn new(hashes: Vec<wtransport::tls::Sha256Digest>) -> Self {
+        Self { hashes }
+    }
+}
+
+impl ServerCertVerifier for WebTransportServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert_hash = Sha256::digest(end_entity.as_ref());
+        let cert_hash_w = wtransport::tls::Sha256Digest::new(cert_hash.into());
+
+        log::debug!("Verifier: received cert with hash: {:?}", cert_hash);
+        log::debug!("Verifier: expected one of hashes: {:?}", self.hashes);
+
+        if self.hashes.contains(&cert_hash_w) {
+            log::debug!("Verifier: SUCCESS, certificate hash matches");
+            Ok(ServerCertVerified::assertion())
+        } else {
+            log::error!("Verifier: FAILED, certificate hash does not match");
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            // Add other schemes as needed
+        ]
     }
 }

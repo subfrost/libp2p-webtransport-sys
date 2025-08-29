@@ -12,6 +12,7 @@ use libp2p::{
 };
 use libp2p_webtransport_sys::transport::{Config, WebTransport};
 use multihash::Multihash;
+use multihash_codetable::Code;
 use sha2::Digest;
 use std::{pin::Pin, sync::Once};
 
@@ -478,4 +479,93 @@ async fn dial_with_custom_client_config() {
         .unwrap()
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn dial_and_listen_with_certhash_and_acme_cert() {
+    init();
+    log::info!("starting dial_and_listen_with_certhash_and_acme_cert test");
+
+    // 1. Load certificate and private key from ACME path
+    let cert_path = shellexpand::tilde("~/.acme.sh/filler-season-apathy.sandshrew.io_ecc/fullchain.cer")
+        .to_string();
+    let key_path = shellexpand::tilde("~/.acme.sh/filler-season-apathy.sandshrew.io_ecc/filler-season-apathy.sandshrew.io.pkcs8.key")
+        .to_string();
+
+    let cert_pem = std::fs::read(cert_path).expect("failed to read certificate");
+    let key_pem = std::fs::read(key_path).expect("failed to read private key");
+
+    // 2. Calculate certhash from the first certificate in the chain
+    let first_cert_der = pem::parse(&cert_pem)
+        .expect("failed to parse PEM")
+        .into_contents();
+
+    let cert_hash = sha2::Sha256::digest(&first_cert_der);
+    let certhash_mh = multihash::Multihash::wrap(Code::Sha2_256.into(), &cert_hash).unwrap();
+
+    // 3. Set up listener transport
+    let listener_keypair = identity::Keypair::generate_ed25519();
+    let listener_peer_id = listener_keypair.public().to_peer_id();
+    let config = Config::CertificateFromMemory {
+        certificate: cert_pem,
+        private_key: key_pem,
+    };
+    let mut listener_transport = WebTransport::new(listener_keypair, config);
+
+    // 4. Start listening
+    let addr: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1/webtransport".parse().unwrap();
+    listener_transport.listen_on(ListenerId::next(), addr).unwrap();
+    let listen_addr = wait_for_listen_addr(&mut listener_transport).await;
+    log::info!("Listener address: {}", listen_addr);
+
+    // 5. Set up dialer transport (no special config needed, it's handled in `dial`)
+    let dialer_keypair = identity::Keypair::generate_ed25519();
+    let dialer_peer_id = dialer_keypair.public().to_peer_id();
+    let mut dialer_transport = WebTransport::new(dialer_keypair, Config::SelfSigned); // Config doesn't matter for dialer
+
+    // 6. Spawn listener task
+    let (mut tx, mut rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            if let TransportEvent::Incoming { upgrade, .. } =
+                poll_fn(|cx| Pin::new(&mut listener_transport).as_mut().poll(cx)).await
+            {
+                let (peer, _muxer) = upgrade.await.unwrap();
+                assert_eq!(peer, dialer_peer_id);
+                tx.try_send(()).unwrap();
+                break;
+            }
+        }
+    });
+
+    // 7. Construct dial address with DNS and certhash
+    let dial_addr = Multiaddr::empty()
+        .with(Protocol::Dns4("filler-season-apathy.sandshrew.io".into()))
+        .with(Protocol::Udp(listen_addr.iter().find_map(|p| if let Protocol::Udp(port) = p { Some(port) } else { None }).unwrap()))
+        .with(Protocol::QuicV1)
+        .with(Protocol::WebTransport)
+        .with(Protocol::Certhash(certhash_mh))
+        .with(Protocol::P2p(listener_peer_id));
+
+    log::info!("Dialing address: {}", dial_addr);
+
+    // 8. Dial the listener
+    let dial_result = dialer_transport
+        .dial(
+            dial_addr,
+            DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::Reuse,
+            },
+        )
+        .unwrap()
+        .await;
+
+    assert!(dial_result.is_ok(), "Dial failed: {:?}", dial_result.err());
+    log::info!("Dial successful");
+
+    // 9. Wait for listener to confirm connection
+    assert!(rx.next().await.is_some(), "Listener did not receive connection");
+    log::info!("dial_and_listen_with_certhash_and_acme_cert test finished");
 }
